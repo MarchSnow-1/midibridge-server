@@ -1,0 +1,185 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Generate release notes
+        run: |
+          npx auto-changelog-plus --starting-version ${{ github.ref_name }}
+          sed -i '1,4d' CHANGELOG.md
+
+      - name: Upload changelog
+        uses: actions/upload-artifact@v4
+        with:
+          name: changelog
+          path: CHANGELOG.md
+
+  build:
+    runs-on: ${{ matrix.os }}
+    needs: changelog
+    if: always() && (needs.changelog.result == 'success' || needs.changelog.result == 'skipped')
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ===== Windows =====
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            platform: windows-amd64
+            ext: .exe
+
+          # ===== Linux =====
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            platform: linux-amd64
+            ext: ""
+
+          - os: ubuntu-22.04
+            goos: linux
+            goarch: arm64
+            platform: linux-arm64
+            ext: ""
+            cc: aarch64-linux-gnu-gcc
+            cxx: aarch64-linux-gnu-g++
+
+          - os: ubuntu-22.04
+            goos: linux
+            goarch: arm
+            goarm: "7"
+            platform: linux-armv7
+            ext: ""
+            cc: arm-linux-gnueabihf-gcc
+            cxx: arm-linux-gnueabihf-g++
+
+          # ===== macOS =====
+          - os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            platform: darwin-amd64
+            ext: ""
+
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            platform: darwin-arm64
+            ext: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          case "${{ matrix.goarch }}" in
+            arm64|arm)
+              if [ "${{ matrix.goarch }}" = "arm64" ]; then
+                DEB_ARCH=arm64
+                CROSS_CC="gcc-aarch64-linux-gnu g++-aarch64-linux-gnu"
+              else
+                DEB_ARCH=armhf
+                CROSS_CC="gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf"
+              fi
+
+              sudo sed -i 's/^deb /deb [arch=amd64] /g; s/^deb-src /deb-src [arch=amd64] /g' /etc/apt/sources.list
+
+              # Ubuntu Ports
+              CODE=$(lsb_release -cs)
+              for suite in "$CODE" "$CODE-updates" "$CODE-security"; do
+                echo "deb [arch=${DEB_ARCH}] http://ports.ubuntu.com/ubuntu-ports/ ${suite} main restricted universe multiverse" \
+                  | sudo tee -a /etc/apt/sources.list
+              done
+
+              sudo dpkg --add-architecture "$DEB_ARCH"
+              sudo apt-get update -q
+              sudo apt-get install -y \
+                libasound2-dev \
+                libasound2-dev:"$DEB_ARCH" \
+                gcc g++ \
+                $CROSS_CC
+              ;;
+            *)
+              sudo apt-get update -q
+              sudo apt-get install -y libasound2-dev gcc g++
+              ;;
+          esac
+
+      - name: Build
+        shell: bash
+        run: |
+          export CGO_ENABLED=1
+          export GOOS=${{ matrix.goos }}
+          export GOARCH=${{ matrix.goarch }}
+          [ -n "${{ matrix.goarm }}" ] && export GOARM=${{ matrix.goarm }}
+
+          [ -n "${{ matrix.cc }}" ]  && export CC=${{ matrix.cc }}
+          [ -n "${{ matrix.cxx }}" ] && export CXX=${{ matrix.cxx }}
+
+          go build \
+            -ldflags "-X main.version=${{ github.ref_name }}" \
+            -o dist/midibridge-server${{ matrix.ext }} \
+            ./src/
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          mv dist/midibridge-server${{ matrix.ext }} \
+             dist/MIDIBridge-Server-${{ github.ref_name }}-${{ matrix.platform }}${{ matrix.ext }}
+
+      - name: Package (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p release/data
+          cp dist/MIDIBridge-Server-${{ github.ref_name }}-${{ matrix.platform }}${{ matrix.ext }} release/
+          cd release && zip -r \
+            ../MIDIBridge-Server-${{ github.ref_name }}-${{ matrix.platform }}.zip .
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release\data | Out-Null
+          Copy-Item "dist\MIDIBridge-Server-${{ github.ref_name }}-${{ matrix.platform }}${{ matrix.ext }}" release\
+          Compress-Archive -Path release\* `
+            -DestinationPath "MIDIBridge-Server-${{ github.ref_name }}-${{ matrix.platform }}.zip"
+
+      - name: Download changelog
+        uses: actions/download-artifact@v4
+        with:
+          name: changelog
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: CHANGELOG.md
+          files: MIDIBridge-Server-${{ github.ref_name }}-${{ matrix.platform }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
