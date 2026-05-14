@@ -1,0 +1,111 @@
+package main
+
+import (
+	"fmt"
+	golog "github.com/donnie4w/go-logger/logger"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+)
+
+// version 在编译时通过 ldflags 注入，默认 "dev" 表示开发构建。
+// 构建命令: go build -ldflags "-X main.version=v1.2.3" ./src/
+var version = "dev"
+
+// main 是 MIDI Bridge Server 的入口函数。启动流程：
+//  1. 初始化控制台日志
+//  2. 加载配置文件（首次运行自动生成默认配置）
+//  3. 根据需要启用文件日志
+//  4. 创建三大核心模块：MIDI 读取器、WebSocket 服务器、HTTP 管理 API
+//  5. 启动各模块并搭建事件总线（MIDI 消息 → WebSocket 广播）
+//  6. 等待 SIGINT/SIGTERM 信号后优雅关闭
+func main() {
+	// 0. 版本标志：--version 或 -v 打印版本后退出
+	for _, arg := range os.Args[1:] {
+		if arg == "--version" || arg == "-v" {
+			fmt.Println("midibridge-server", version)
+			return
+		}
+	}
+
+	// 1. 初始化日志（先仅控制台）
+	initLogger(false)
+
+	golog.Info("MIDIBridge Server " + version + " starting...")
+
+	// 2. 加载配置
+	configPath := filepath.Join(".", "data", "config.json")
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		golog.Error("Startup failed: " + err.Error())
+		os.Exit(1)
+	}
+
+	// 3. 按需启用文件日志
+	if cfg.Logging.File {
+		enableFileLogging()
+	}
+
+	// 4. 创建各模块
+	midiReader := NewMidiReader()
+	wsServer := NewWSServer(cfg)
+	adminServer := NewAdminServer(cfg, wsServer, midiReader)
+
+	// 5. 启动
+	adminServer.Start()
+	wsServer.Start()
+	midiReader.Start(cfg.MIDI.DeviceName, cfg.MIDI.ReconnectIntervalMs)
+
+	// 6. 事件总线
+	// MIDI 消息 → WebSocket 广播给所有已认证客户端
+	verboseLog := cfg.Logging.MidiVerbose
+	go func() {
+		for msg := range midiReader.Msgs {
+			if verboseLog {
+				if s := midiVerbose(msg.Data); s != "" {
+					golog.Info(s)
+				}
+			}
+			wsServer.Broadcast(msg)
+		}
+	}()
+
+	// 设备连接事件 → 日志记录
+	go func() {
+		for evt := range midiReader.Connects {
+			golog.Info(fmt.Sprintf("MIDI device connected: [%d] \"%s\"", evt.Index, evt.Name))
+		}
+	}()
+
+	// 设备断开事件 → 日志告警
+	go func() {
+		for range midiReader.Disconnects {
+			golog.Warn("MIDI device disconnected, waiting for reconnect...")
+		}
+	}()
+
+	// 7. 打印就绪信息
+	golog.Info("WebSocket server: ws://0.0.0.0:" + itoa(cfg.WS.Port))
+	golog.Info("HTTP admin API: http://0.0.0.0:" + itoa(cfg.Admin.Port))
+	deviceLabel := cfg.MIDI.DeviceName
+	if deviceLabel == "" {
+		deviceLabel = "(auto)"
+	}
+	golog.Info("Target MIDI device: " + deviceLabel)
+	golog.Info("Ready, waiting for connections")
+
+	// 8. 等待退出信号
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigCh
+
+	golog.Info("Received " + sig.String() + ", shutting down...")
+
+	// 优雅关闭：先停 MIDI（断开硬件），再停 WebSocket（踢出客户端），最后停 HTTP
+	midiReader.Stop()
+	wsServer.Stop()
+	adminServer.Stop()
+
+	golog.Info("Goodbye.")
+}
