@@ -1,8 +1,8 @@
 package main
 
 import (
+golog "github.com/donnie4w/go-logger/logger"
 	"encoding/json"
-	golog "github.com/donnie4w/go-logger/logger"
 	"io"
 	"net"
 	"net/http"
@@ -251,7 +251,7 @@ func (a *AdminServer) handleChangePassword(w http.ResponseWriter, r *http.Reques
 	}
 
 	// 7. 密码已更改，踢出所有客户端强制重新认证
-	a.wsServer.KickAllClients("password_changed")
+	a.wsServer.KickAllClients(kickPasswordChanged)
 
 	writeJSON(w, 200, map[string]interface{}{
 		"success": true,
