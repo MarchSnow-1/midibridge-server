@@ -1,7 +1,7 @@
 package main
 
 import (
-	golog "github.com/donnie4w/go-logger/logger"
+golog "github.com/donnie4w/go-logger/logger"
 	"strings"
 	"sync"
 	"time"
@@ -295,8 +295,11 @@ func midiVerbose(data []byte) string {
 		if len(data) < 3 {
 			return ""
 		}
-		cc := int(data[1])
-		val := int(data[2])
+cc := int(data[1])
+			if cc == 123 || cc == 120 {
+			return ""
+			}
+			val := int(data[2])
 		return "CH" + itoa(channel) + " CC#" + itoa(cc) + " = " + itoa(val)
 
 	case 0xC0: // Program Change
