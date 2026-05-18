@@ -1,8 +1,8 @@
 package main
 
 import (
+golog "github.com/donnie4w/go-logger/logger"
 	"fmt"
-	golog "github.com/donnie4w/go-logger/logger"
 	"os"
 	"os/signal"
 	"path/filepath"
