@@ -1,14 +1,21 @@
 package main
 
 import (
+golog "github.com/donnie4w/go-logger/logger"
 	"encoding/json"
-	golog "github.com/donnie4w/go-logger/logger"
 	"net"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+)
+
+// 踢出原因常量
+const (
+	kickAuthTimeout     = "auth_timeout"
+	kickServerShutdown  = "server_shutdown"
+	kickPasswordChanged = "password_changed"
 )
 
 // authTimeout 定义新连接必须在多长时间内完成认证，超时未认证将被踢出。
@@ -111,19 +118,17 @@ func (s *WSServer) handleConnection(w http.ResponseWriter, r *http.Request) {
 			golog.Warn("Client " + clientIP + " auth timed out")
 			client.sendJSON(map[string]interface{}{
 				"type":   "kicked",
-				"reason": "Auth timeout",
+				"reason": kickAuthTimeout,
 			})
 			client.conn.Close()
 			s.removeClient(client)
 		}
 	})
 
-	// 阻塞式消息读取循环（在 goroutine 中运行，不阻塞 accept 循环）
 	s.readLoop(client, authTimer)
 }
 
 // readLoop 循环读取客户端消息，根据消息 type 分发到不同处理函数。
-// 当连接断开或发生错误时，清理客户端资源并退出。
 func (s *WSServer) readLoop(client *WSClient, authTimer *time.Timer) {
 	defer func() {
 		authTimer.Stop()
@@ -134,7 +139,6 @@ func (s *WSServer) readLoop(client *WSClient, authTimer *time.Timer) {
 	for {
 		_, rawMsg, err := client.conn.ReadMessage()
 		if err != nil {
-			// 仅对已认证的客户端记录断开日志（未认证的断开属于正常情况）
 			client.mu.Lock()
 			authed := client.authenticated
 			client.mu.Unlock()
@@ -154,11 +158,9 @@ func (s *WSServer) readLoop(client *WSClient, authTimer *time.Timer) {
 
 		switch msgType {
 		case "auth":
-			// 密码认证
 			s.handleAuth(client, msg, authTimer)
 
 		case "ping":
-			// 心跳保活
 			client.sendJSON(map[string]string{"type": "pong"})
 
 		default:
@@ -167,10 +169,8 @@ func (s *WSServer) readLoop(client *WSClient, authTimer *time.Timer) {
 	}
 }
 
-// handleAuth 处理客户端认证消息。认证成功则标记客户端为已授权并停止超时计时器；
-// 认证失败则发送 auth_fail 并关闭连接。
+// handleAuth 处理客户端认证消息。
 func (s *WSServer) handleAuth(client *WSClient, msg map[string]interface{}, authTimer *time.Timer) {
-	// 已认证客户端重复发送 auth 消息，直接回复 ok
 	client.mu.Lock()
 	if client.authenticated {
 		client.mu.Unlock()
@@ -184,7 +184,7 @@ func (s *WSServer) handleAuth(client *WSClient, msg map[string]interface{}, auth
 		client.mu.Lock()
 		client.authenticated = true
 		client.mu.Unlock()
-		authTimer.Stop() // 认证成功，取消超时计时器
+		authTimer.Stop()
 		client.sendJSON(map[string]string{"type": "auth_ok"})
 		golog.Info("Client authenticated: " + client.ip)
 	} else {
@@ -193,7 +193,7 @@ func (s *WSServer) handleAuth(client *WSClient, msg map[string]interface{}, auth
 			"type":   "auth_fail",
 			"reason": "Incorrect password",
 		})
-		client.conn.Close() // 认证失败立即断开
+		client.conn.Close()
 	}
 }
 
@@ -205,7 +205,6 @@ func (s *WSServer) removeClient(client *WSClient) {
 }
 
 // Broadcast 将 MIDI 消息广播给所有已认证的客户端。
-// 该函数通过 MidiReader.Msgs channel 由事件总线触发。
 func (s *WSServer) Broadcast(data MidiMessage) {
 	payload, _ := json.Marshal(map[string]interface{}{
 		"type": "midi",
@@ -216,59 +215,24 @@ func (s *WSServer) Broadcast(data MidiMessage) {
 	})
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	authedClients := make([]*WSClient, 0, len(s.clients))
 	for client := range s.clients {
 		client.mu.Lock()
-		authed := client.authenticated
-		client.mu.Unlock()
-		if authed {
-			client.sendRaw(payload)
+		if client.authenticated {
+			authedClients = append(authedClients, client)
 		}
-	}
-}
-
-// sendAllNotesOff 向所有已认证客户端发送 16 个通道的 All Notes Off (CC#123)
-// 和 All Sound Off (CC#120) 消息。在踢出客户端或服务器关闭前调用，
-// 防止 MIDI 音符卡死（音符一直响）。
-func (s *WSServer) sendAllNotesOff() {
-	for ch := 0; ch < 16; ch++ {
-		s.broadcastRaw(0, []byte{byte(0xB0 | ch), 0x7B, 0}) // CC#123 All Notes Off
-		s.broadcastRaw(0, []byte{byte(0xB0 | ch), 0x78, 0}) // CC#120 All Sound Off
-	}
-}
-
-// broadcastRaw 将原始 MIDI 字节封装为 JSON 后广播给所有已认证客户端。
-func (s *WSServer) broadcastRaw(deltaTime float64, msg []byte) {
-	payload, _ := json.Marshal(map[string]interface{}{
-		"type": "midi",
-		"data": map[string]interface{}{
-			"t": deltaTime,
-			"m": msg,
-		},
-	})
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for client := range s.clients {
-		client.mu.Lock()
-		authed := client.authenticated
 		client.mu.Unlock()
-		if authed {
-			client.sendRaw(payload)
-		}
+	}
+	s.mu.Unlock()
+
+	for _, client := range authedClients {
+		client.sendRaw(payload)
 	}
 }
 
 // KickAllClients 踢出当前所有连接的客户端。
-// 流程：发送 All Notes Off（防止音符卡死）→ 发送 kicked 消息 → 关闭所有连接 → 清空客户端列表。
-// reason 参数会出现在客户端的 kicked 消息中，方便客户端区分踢出原因。
+// 流程：发送 kicked 消息 → 关闭所有连接 → 清空客户端列表。
 func (s *WSServer) KickAllClients(reason string) {
-	// 先发 All Notes Off，确保所有合成器/音源停止出声
-	s.sendAllNotesOff()
-
-	// 获取当前所有客户端快照（在锁内读取，锁外操作连接）
 	s.mu.Lock()
 	clients := make([]*WSClient, 0, len(s.clients))
 	for c := range s.clients {
@@ -281,12 +245,12 @@ func (s *WSServer) KickAllClients(reason string) {
 		"reason": reason,
 	})
 
+	// 发 kicked 通知并关闭连接
 	for _, client := range clients {
 		client.sendRaw(kickMsg)
 		client.conn.Close()
 	}
 
-	// 清空客户端集合
 	s.mu.Lock()
 	s.clients = make(map[*WSClient]struct{})
 	s.mu.Unlock()
@@ -303,19 +267,18 @@ func (s *WSServer) ClientCount() int {
 
 // Stop 优雅关闭 WebSocket 服务器：先踢出所有客户端，再关闭 HTTP 监听器。
 func (s *WSServer) Stop() {
-	s.KickAllClients("server_shutdown")
+	s.KickAllClients(kickServerShutdown)
 	s.httpServer.Close()
 	golog.Info("WebSocket server stopped")
 }
 
-// sendJSON 将任意值序列化为 JSON 后发送给该客户端。忽略序列化错误（不可能发生）。
+// sendJSON 将任意值序列化为 JSON 后发送给该客户端。
 func (c *WSClient) sendJSON(v interface{}) {
 	data, _ := json.Marshal(v)
 	c.sendRaw(data)
 }
 
-// sendRaw 向该客户端发送原始字节数据。设置 2 秒写入超时防止慢客户端
-// 无限阻塞服务器。发送失败仅记录日志，不关闭连接（由 readLoop 的 ReadMessage 错误处理关闭）。
+// sendRaw 向该客户端发送原始字节数据。
 func (c *WSClient) sendRaw(data []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
