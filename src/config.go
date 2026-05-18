@@ -1,9 +1,9 @@
 package main
 
 import (
+golog "github.com/donnie4w/go-logger/logger"
 	"encoding/json"
 	"fmt"
-	golog "github.com/donnie4w/go-logger/logger"
 	"os"
 	"path/filepath"
 	"sync"
