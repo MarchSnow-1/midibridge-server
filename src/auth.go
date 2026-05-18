@@ -1,9 +1,9 @@
 package main
 
 import (
+golog "github.com/donnie4w/go-logger/logger"
 	"errors"
 	"fmt"
-	golog "github.com/donnie4w/go-logger/logger"
 
 	"golang.org/x/crypto/bcrypt"
 )
