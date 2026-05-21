@@ -4,7 +4,16 @@
 
 把 MIDI 设备的信号通过网络实时传给其他设备
 
-> 本仓库：`github.com/MarchSnow-1/midibridge-server`
+<!-- Badges -->
+
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-blue?style=for-the-badge)](https://github.com/MarchSnow-1/midibridge-server)
+[![Golang](https://img.shields.io/badge/Golang-1.26%2B-green?style=for-the-badge)](https://go.dev)
+[![License](https://img.shields.io/badge/License-MIT-orange?style=for-the-badge)](LICENSE)
+<br>
+[![GitHub Release](https://img.shields.io/github/v/release/MarchSnow-1/midibridge-server?style=for-the-badge)](https://github.com/MarchSnow-1/midibridge-server/releases)
+[![GitHub Repo stars](https://img.shields.io/github/stars/MarchSnow-1/midibridge-server?style=for-the-badge)](https://github.com/MarchSnow-1/midibridge-server)
+[![GitHub Last Commit](https://img.shields.io/github/last-commit/MarchSnow-1/midibridge-server?style=for-the-badge)](https://github.com/MarchSnow-1/midibridge-server)
+[![Total Download](https://img.shields.io/github/downloads/MarchSnow-1/midibridge-server/total?style=for-the-badge)](https://github.com/MarchSnow-1/midibridge-server/releases)
 
 [**English**](README.md) | [**简体中文**](README_zh-CN.md)
 
