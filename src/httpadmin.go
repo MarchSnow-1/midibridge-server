@@ -118,7 +118,7 @@ func (a *AdminServer) Start() error {
 	mux.HandleFunc("/admin/change-password", a.handleChangePassword)
 
 	a.httpServer = &http.Server{
-		Addr:    ":" + itoa(a.cfg.Admin.Port),
+		Addr:    a.cfg.Network.Bind + ":" + itoa(a.cfg.Admin.Port),
 		Handler: mux,
 	}
 

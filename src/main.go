@@ -47,6 +47,18 @@ func main() {
 		enableFileLogging()
 	}
 
+	// 3.5 暴露面警示：监听所有接口或白名单为空时，显著提醒管理员
+	bind := cfg.Network.Bind
+	if bind == "" || bind == "0.0.0.0" || bind == "::" {
+		golog.Warn("Listening on ALL network interfaces (transport is plaintext) — do not expose to untrusted networks")
+	}
+	if cfg.WS.AllowedIPs == "" {
+		golog.Warn("ws.allowedIPs is empty: ANY IP may connect to the WebSocket port")
+	}
+	if cfg.Admin.AllowedIPs == "" {
+		golog.Warn("admin.allowedIPs is empty: the admin API is reachable from ANY IP — strongly consider setting an allowlist")
+	}
+
 	// 4. 创建各模块
 	midiReader := NewMidiReader()
 	wsServer := NewWSServer(cfg)
@@ -86,8 +98,12 @@ func main() {
 	}()
 
 	// 7. 打印就绪信息
-	golog.Info("WebSocket server: ws://0.0.0.0:" + itoa(cfg.WS.Port))
-	golog.Info("HTTP admin API: http://0.0.0.0:" + itoa(cfg.Admin.Port))
+	displayBind := cfg.Network.Bind
+	if displayBind == "" {
+		displayBind = "0.0.0.0"
+	}
+	golog.Info("WebSocket server: ws://" + displayBind + ":" + itoa(cfg.WS.Port))
+	golog.Info("HTTP admin API: http://" + displayBind + ":" + itoa(cfg.Admin.Port))
 	deviceLabel := cfg.MIDI.DeviceName
 	if deviceLabel == "" {
 		deviceLabel = "(auto)"

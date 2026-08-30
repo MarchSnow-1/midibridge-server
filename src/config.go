@@ -39,6 +39,7 @@ type Config struct {
 	Auth    AuthConfig    `json:"auth"`
 	MIDI    MIDIConfig    `json:"midi"`
 	Logging LoggingConfig `json:"logging"`
+	Network NetworkConfig `json:"network"`
 
 	mu   sync.RWMutex // 保护配置字段的并发读写
 	path string       // config.json 的绝对路径
@@ -77,6 +78,11 @@ type LoggingConfig struct {
 	MidiVerbose bool `json:"midiVerbose"` // 是否记录每条 MIDI 按键/控制事件，默认 false
 }
 
+// NetworkConfig 网络监听配置
+type NetworkConfig struct {
+	Bind string `json:"bind"` // 监听地址。为空表示监听所有网络接口
+}
+
 // defaultConfig 返回一份带有合理默认值的全新 Config 实例。
 // 该函数不涉及任何 I/O 操作，仅构造数据结构。
 func defaultConfig() Config {
@@ -103,6 +109,9 @@ func defaultConfig() Config {
 		Logging: LoggingConfig{
 			File:        false,
 			MidiVerbose: false,
+		},
+		Network: NetworkConfig{
+			Bind: "",
 		},
 	}
 }
@@ -149,8 +158,48 @@ func loadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("corrupted config file, delete it and restart: %w", err)
 	}
 
+	// 检测未知顶层键（如拼错的 allowedIps），仅告警不拒绝加载——
+	// 避免安全关键配置因拼写错误而静默失效
+	var rawKeys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawKeys); err == nil {
+		known := map[string]bool{"ws": true, "admin": true, "auth": true, "midi": true, "logging": true, "network": true}
+		for k := range rawKeys {
+			if !known[k] {
+				golog.Warn("Unknown config key \"" + k + "\" ignored — check for typos")
+			}
+		}
+	}
+
+	// 校验并纠正非法配置值
+	cfg.validate()
+
 	golog.Info("Config loaded")
 	return &cfg, nil
+}
+
+// validate 校验加载后的配置值。非法值回退为默认值并记录告警，
+// 防止畸形配置（如 rateLimitWindowMs<=0）静默禁用速率限制等安全机制。
+func (c *Config) validate() {
+	if c.WS.Port < 1 || c.WS.Port > 65535 {
+		golog.Warn(fmt.Sprintf("Invalid ws.port %d, falling back to 9001", c.WS.Port))
+		c.WS.Port = 9001
+	}
+	if c.Admin.Port < 1 || c.Admin.Port > 65535 {
+		golog.Warn(fmt.Sprintf("Invalid admin.port %d, falling back to 9002", c.Admin.Port))
+		c.Admin.Port = 9002
+	}
+	if c.Admin.RateLimitWindowMs <= 0 {
+		golog.Warn(fmt.Sprintf("Invalid admin.rateLimitWindowMs %d, falling back to 60000", c.Admin.RateLimitWindowMs))
+		c.Admin.RateLimitWindowMs = 60000
+	}
+	if c.Admin.RateLimitMaxReqs <= 0 {
+		golog.Warn(fmt.Sprintf("Invalid admin.rateLimitMaxRequests %d, falling back to 5", c.Admin.RateLimitMaxReqs))
+		c.Admin.RateLimitMaxReqs = 5
+	}
+	if c.MIDI.ReconnectIntervalMs <= 0 {
+		golog.Warn(fmt.Sprintf("Invalid midi.reconnectIntervalMs %d, falling back to 3000", c.MIDI.ReconnectIntervalMs))
+		c.MIDI.ReconnectIntervalMs = 3000
+	}
 }
 
 // save 将当前配置以缩进格式写回磁盘。首次保存时自动创建 data 目录。
