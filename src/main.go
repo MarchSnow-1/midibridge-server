@@ -65,6 +65,10 @@ func main() {
 		golog.Warn("admin.allowedIPs is empty: the admin API is reachable from ANY IP — strongly consider setting an allowlist")
 	}
 
+	// 3.6 白名单启动期校验：非法条目/写反范围等立即告警，避免静默失效
+	validateAllowlist("ws", cfg.WS.AllowedIPs)
+	validateAllowlist("admin", cfg.Admin.AllowedIPs)
+
 	// 4. 创建各模块
 	midiReader := NewMidiReader()
 	wsServer := NewWSServer(cfg)
