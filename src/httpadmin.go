@@ -193,9 +193,11 @@ func (a *AdminServer) Start() error {
 	return nil
 }
 
-// Stop 关闭 HTTP 管理服务器。
+// Stop 关闭 HTTP 管理服务器。判空保护：Start() 失败/未调用时不会 panic。
 func (a *AdminServer) Stop() {
-	a.httpServer.Close()
+	if a.httpServer != nil {
+		a.httpServer.Close()
+	}
 }
 
 // clientIP 从 http.Request 中提取客户端真实 IP，去除端口号。

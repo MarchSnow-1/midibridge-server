@@ -216,6 +216,9 @@ func (s *WSServer) Start() error {
 	s.httpServer = &http.Server{
 		Addr:    addr,
 		Handler: mux,
+		// 仅限制握手阶段的头部读取时间（防慢速头部占用）；
+		// 不设置 Read/WriteTimeout——它们会误杀已升级的长连接
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	go func() {
@@ -538,9 +541,12 @@ func (s *WSServer) ClientCount() int {
 }
 
 // Stop 优雅关闭 WebSocket 服务器：先踢出所有客户端，再关闭 HTTP 监听器。
+// 判空保护：Start() 失败/未调用时 Stop() 不会 panic。
 func (s *WSServer) Stop() {
 	s.KickAllClients(kickServerShutdown)
-	s.httpServer.Close()
+	if s.httpServer != nil {
+		s.httpServer.Close()
+	}
 	close(s.done)
 	golog.Info("WebSocket server stopped")
 }
