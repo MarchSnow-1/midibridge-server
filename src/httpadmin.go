@@ -264,16 +264,15 @@ func (a *AdminServer) handleChangePassword(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// 6. 执行密码修改
+	// 6. 执行密码修改。任何失败一律返回同一状态码与同一文案，
+	// 细节只写服务端日志——既避免内部错误（如 bcrypt 细节、磁盘错误）
+	// 泄露给客户端，也消除 403/400 状态码差异构成的旧密码探测预言机。
 	err = changePassword(a.cfg, req.OldPassword, req.NewPassword)
 	if err != nil {
-		status := 400
-		if err == errOldPasswordIncorrect {
-			status = 403 // 旧密码错误返回 403
-		}
-		writeJSON(w, status, map[string]interface{}{
+		golog.Warn("Change password failed: " + err.Error() + " ip=" + ip)
+		writeJSON(w, 403, map[string]interface{}{
 			"success": false,
-			"error":   err.Error(),
+			"error":   "Invalid old or new password",
 		})
 		return
 	}
