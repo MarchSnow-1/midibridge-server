@@ -45,8 +45,10 @@ type MidiReader struct {
 	droppedInCallback int64
 	droppedForward    int64
 
-	mu   sync.Mutex    // 保护 in、drv 和 shouldReconnect 的并发访问
-	done chan struct{} // 关闭信号——通知所有 goroutine 退出
+	mu       sync.Mutex    // 保护 in、drv 和 shouldReconnect 的并发访问
+	done     chan struct{} // 关闭信号——通知所有 goroutine 退出
+	stopped  bool          // Stop 幂等标志
+	loopDone chan struct{} // runLoop 完全退出后关闭，用于 Stop 的关闭顺序控制
 }
 
 // midiMsg 是内部使用的轻量级消息结构，避免暴露 Listener 的 deltaMicroseconds 参数
@@ -67,13 +69,18 @@ func NewMidiReader() *MidiReader {
 	}
 }
 
-// Start 设置目标设备名和重连参数，然后启动后台主循环
-// deviceName 为空字符串时，回退到使用系统首个 MIDI 输入端口
-func (m *MidiReader) Start(deviceName string, reconnectIntervalMs int) {
+// Start 设置目标设备名和重连参数，然后启动后台主循环。
+// autoReconnect=false 时：仍会做一次初始连接尝试，但失败或设备断开后不再重连。
+// deviceName 为空字符串时，回退到使用系统首个 MIDI 输入端口。
+func (m *MidiReader) Start(deviceName string, reconnectIntervalMs int, autoReconnect bool) {
 	m.deviceName = deviceName
 	m.reconnectInterval = time.Duration(reconnectIntervalMs) * time.Millisecond
-	m.shouldReconnect = true
-	go m.runLoop()
+	m.shouldReconnect = autoReconnect
+	m.loopDone = make(chan struct{})
+	go func() {
+		m.runLoop()
+		close(m.loopDone)
+	}()
 	go m.dropMonitor()
 }
 
@@ -97,16 +104,26 @@ func (m *MidiReader) dropMonitor() {
 	}
 }
 
-// Stop 发出停止信号，关闭 MIDI 端口和驱动，释放所有资源
-// 该方法是幂等的 多次调用不会 panic
+// Stop 发出停止信号，关闭 MIDI 端口和驱动，释放所有资源。
+// 该方法是幂等的，多次调用不会 panic。
+// 关闭顺序：发停止信号 → 关硬件 → 等待主循环（含 readLoop）完全退出 →
+// 关闭对外暴露的 channel（Msgs/Connects/Disconnects），使 main 中的
+// 消费协程（for range）能正常终止。内部 msgCh 永不关闭——
+// 驱动回调可能在关停瞬间仍在投递，关闭它会引发 send-on-closed panic。
 func (m *MidiReader) Stop() {
 	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		return
+	}
+	m.stopped = true
 	m.shouldReconnect = false
+	loopDone := m.loopDone
 	m.mu.Unlock()
+
 	close(m.done)
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.in != nil && m.in.IsOpen() {
 		m.in.Close()
 		m.in = nil
@@ -115,6 +132,20 @@ func (m *MidiReader) Stop() {
 		m.drv.Close()
 		m.drv = nil
 	}
+	m.mu.Unlock()
+
+	// 等待主循环（含 readLoop）完全退出，之后再关闭对外 channel，
+	// 杜绝向已关闭 channel 发送的窗口
+	if loopDone != nil {
+		select {
+		case <-loopDone:
+		case <-time.After(5 * time.Second):
+			golog.Warn("Timed out waiting for MIDI loop to exit — closing channels anyway")
+		}
+	}
+	close(m.Msgs)
+	close(m.Connects)
+	close(m.Disconnects)
 	golog.Info("MIDI reader stopped")
 }
 
@@ -125,21 +156,15 @@ func (m *MidiReader) IsConnected() bool {
 	return m.in != nil && m.in.IsOpen()
 }
 
-// runLoop 主循环，不断执行 tryConnect → readLoop → 等待 → 重连的过程
-// 只要 shouldReconnect 为 true 且 done 未关闭，就会一直循环
+// runLoop 主循环：连接设备 → readLoop 阻塞读取 → 断开后按配置决定是否重连。
+// 首次连接尝试总是执行；其后仅在 shouldReconnect 为 true 时继续重试，
+// 只要 done 未关闭就一直循环。
 func (m *MidiReader) runLoop() {
 	for {
 		select {
 		case <-m.done:
 			return
 		default:
-		}
-
-		m.mu.Lock()
-		reconnect := m.shouldReconnect
-		m.mu.Unlock()
-		if !reconnect {
-			return
 		}
 
 		connected := m.tryConnect()
@@ -151,6 +176,19 @@ func (m *MidiReader) runLoop() {
 			case m.Disconnects <- struct{}{}:
 			default:
 			}
+		}
+
+		// 断开或连接失败后：按配置决定是否继续重连
+		m.mu.Lock()
+		reconnect := m.shouldReconnect
+		m.mu.Unlock()
+		if !reconnect {
+			if !connected {
+				golog.Warn("MIDI connection failed and autoReconnect is disabled — giving up")
+			} else {
+				golog.Info("MIDI device disconnected and autoReconnect is disabled — stopping")
+			}
+			return
 		}
 
 		// 等待重连间隔（同时监听 done 以便快速退出）
