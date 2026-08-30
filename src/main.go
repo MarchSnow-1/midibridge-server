@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -122,8 +123,8 @@ func main() {
 	if cfg.TLSEnabled() {
 		wsScheme, adminScheme = "wss", "https"
 	}
-	golog.Info("WebSocket server: " + wsScheme + "://" + displayBind + ":" + itoa(cfg.WS.Port))
-	golog.Info("HTTP admin API: " + adminScheme + "://" + displayBind + ":" + itoa(cfg.Admin.Port))
+	golog.Info("WebSocket server: " + wsScheme + "://" + displayBind + ":" + strconv.Itoa(cfg.WS.Port))
+	golog.Info("HTTP admin API: " + adminScheme + "://" + displayBind + ":" + strconv.Itoa(cfg.Admin.Port))
 	deviceLabel := cfg.MIDI.DeviceName
 	if deviceLabel == "" {
 		deviceLabel = "(auto)"

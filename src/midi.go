@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -243,7 +244,7 @@ func (m *MidiReader) tryConnect() bool {
 			golog.Error("not found target midi device: " + m.deviceName)
 			golog.Error("Available devices:")
 			for _, in := range ins {
-				golog.Error("  [" + itoa(in.Number()) + "] " + in.String())
+				golog.Error("  [" + strconv.Itoa(in.Number()) + "] " + in.String())
 			}
 			return false
 		}
@@ -311,20 +312,6 @@ func (m *MidiReader) readLoop() {
 	}
 }
 
-// itoa 是将整数转为字符串的轻量实现，避免引入 strconv 或 fmt 的包
-// 仅在 MIDI 端口号和日志输出中使用，输入值范围为 0~65535
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	s := ""
-	for i > 0 {
-		s = string(rune('0'+i%10)) + s
-		i /= 10
-	}
-	return s
-}
-
 // 音符名称映射（MIDI 音符编号 mod 12）
 var noteNames = [12]string{"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"}
 
@@ -348,7 +335,7 @@ func midiVerbose(data []byte) string {
 		vel := int(data[2])
 		oct := int(note/12) - 1
 		name := noteNames[note%12]
-		return "CH" + itoa(channel) + " Note Off: " + name + itoa(oct) + " vel=" + itoa(vel)
+		return "CH" + strconv.Itoa(channel) + " Note Off: " + name + strconv.Itoa(oct) + " vel=" + strconv.Itoa(vel)
 
 	case 0x90: // Note On (velocity=0 视为 Note Off)
 		if len(data) < 3 {
@@ -359,9 +346,9 @@ func midiVerbose(data []byte) string {
 		oct := int(note/12) - 1
 		name := noteNames[note%12]
 		if vel == 0 {
-			return "CH" + itoa(channel) + " Note Off: " + name + itoa(oct) + " (vel=0)"
+			return "CH" + strconv.Itoa(channel) + " Note Off: " + name + strconv.Itoa(oct) + " (vel=0)"
 		}
-		return "CH" + itoa(channel) + " Note On:  " + name + itoa(oct) + " vel=" + itoa(vel)
+		return "CH" + strconv.Itoa(channel) + " Note On:  " + name + strconv.Itoa(oct) + " vel=" + strconv.Itoa(vel)
 
 	case 0xB0: // Control Change
 		if len(data) < 3 {
@@ -372,11 +359,11 @@ cc := int(data[1])
 			return ""
 			}
 			val := int(data[2])
-		return "CH" + itoa(channel) + " CC#" + itoa(cc) + " = " + itoa(val)
+		return "CH" + strconv.Itoa(channel) + " CC#" + strconv.Itoa(cc) + " = " + strconv.Itoa(val)
 
 	case 0xC0: // Program Change
 		prog := int(data[1])
-		return "CH" + itoa(channel) + " Program: " + itoa(prog)
+		return "CH" + strconv.Itoa(channel) + " Program: " + strconv.Itoa(prog)
 
 	case 0xE0: // Pitch Bend
 		if len(data) < 3 {
@@ -385,7 +372,7 @@ cc := int(data[1])
 		lsb := int(data[1])
 		msb := int(data[2])
 		val := (msb<<7 | lsb) - 8192 // 居中为 0
-		return "CH" + itoa(channel) + " Pitch: " + itoa(val)
+		return "CH" + strconv.Itoa(channel) + " Pitch: " + strconv.Itoa(val)
 	}
 	return "" // 系统消息不记录
 }

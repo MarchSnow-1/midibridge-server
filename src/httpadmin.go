@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -154,7 +155,7 @@ func (a *AdminServer) Start() error {
 	mux.HandleFunc("/admin/status", a.handleStatus)
 	mux.HandleFunc("/admin/change-password", a.handleChangePassword)
 
-	addr := a.cfg.Network.Bind + ":" + itoa(a.cfg.Admin.Port)
+	addr := a.cfg.Network.Bind + ":" + strconv.Itoa(a.cfg.Admin.Port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen admin API on %s: %w", addr, err)

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -198,7 +199,7 @@ func (s *WSServer) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleConnection)
 
-	addr := s.cfg.Network.Bind + ":" + itoa(s.cfg.WS.Port)
+	addr := s.cfg.Network.Bind + ":" + strconv.Itoa(s.cfg.WS.Port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen WebSocket on %s: %w", addr, err)
