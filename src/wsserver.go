@@ -61,7 +61,7 @@ func (s *WSServer) Start() error {
 	mux.HandleFunc("/", s.handleConnection)
 
 	s.httpServer = &http.Server{
-		Addr:    ":" + itoa(s.cfg.WS.Port),
+		Addr:    s.cfg.Network.Bind + ":" + itoa(s.cfg.WS.Port),
 		Handler: mux,
 	}
 
