@@ -302,7 +302,9 @@ func (s *WSServer) handleAuth(client *WSClient, msg map[string]interface{}, auth
 	client.mu.Unlock()
 
 	password, _ := msg["password"].(string)
-	if verifyPassword(s.cfg.Auth.PasswordHash, password) {
+	// 经读锁快照读取哈希，避免与改密写路径构成数据竞争
+	hash, _ := s.cfg.GetAuthSnapshot()
+	if verifyPassword(hash, password) {
 		client.mu.Lock()
 		client.authenticated = true
 		client.mu.Unlock()

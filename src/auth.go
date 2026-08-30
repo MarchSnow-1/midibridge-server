@@ -39,13 +39,9 @@ func verifyPassword(hash, plainPassword string) bool {
 //   - 旧密码必须正确
 //   - 新密码至少 8 个 Unicode 字符（按字符计而非字节），且不超过 72 字节
 //   - bcrypt cost factor = 10（在合理安全性和性能之间取得平衡）
+//   - "验证旧密码→写入新哈希"全程持有写锁，与并发读快照互斥
 func changePassword(cfg *Config, oldPassword, newPassword string) error {
-	// 第一步：验证旧密码
-	if !verifyPassword(cfg.Auth.PasswordHash, oldPassword) {
-		return errOldPasswordIncorrect
-	}
-
-	// 第二步：新密码长度检查（按 Unicode 字符计数，避免多字节文字被低估）
+	// 第一步：新密码格式检查（无需持锁；对外响应统一，不泄露校验顺序）
 	if utf8.RuneCountInString(newPassword) < minPasswordLen {
 		return errPasswordTooShort
 	}
@@ -54,14 +50,22 @@ func changePassword(cfg *Config, oldPassword, newPassword string) error {
 		return errPasswordTooLong
 	}
 
+	// 第二步：全程持写锁，保证并发改密/并发读快照的原子性与可见性
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+
+	if !verifyPassword(cfg.Auth.PasswordHash, oldPassword) {
+		return errOldPasswordIncorrect
+	}
+
 	// 第三步：生成 bcrypt 哈希
 	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), 10)
 	if err != nil {
 		return fmt.Errorf("failed to hash new password: %w", err)
 	}
 
-	// 第四步：持久化新哈希到配置文件
-	if err := cfg.SetPasswordHash(string(hash)); err != nil {
+	// 第四步：持久化新哈希到配置文件（锁内完成，避免中间态）
+	if err := cfg.setPasswordHashLocked(string(hash)); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 

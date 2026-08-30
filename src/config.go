@@ -249,3 +249,21 @@ func (c *Config) SetPasswordHash(hash string) error {
 	c.Auth.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	return c.save()
 }
+
+// GetAuthSnapshot 在读锁下返回密码哈希与更新时间的快照。
+// 所有读取方必须经由本接口，不得直接访问 Auth 字段，
+// 否则与写锁路径构成数据竞争。
+func (c *Config) GetAuthSnapshot() (hash, updatedAt string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Auth.PasswordHash, c.Auth.UpdatedAt
+}
+
+// setPasswordHashLocked 在调用方已持有写锁时更新哈希并落盘。
+// 供 changePassword 在"验证旧密码→写入新哈希"的原子区间内使用，
+// 避免嵌套调用 SetPasswordHash 造成死锁。
+func (c *Config) setPasswordHashLocked(hash string) error {
+	c.Auth.PasswordHash = hash
+	c.Auth.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	return c.save()
+}
