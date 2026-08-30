@@ -64,9 +64,15 @@ func main() {
 	wsServer := NewWSServer(cfg)
 	adminServer := NewAdminServer(cfg, wsServer, midiReader)
 
-	// 5. 启动
-	adminServer.Start()
-	wsServer.Start()
+	// 5. 启动（任一监听失败立即退出，绝不"假活"）
+	if err := adminServer.Start(); err != nil {
+		golog.Error("Startup failed: " + err.Error())
+		os.Exit(1)
+	}
+	if err := wsServer.Start(); err != nil {
+		golog.Error("Startup failed: " + err.Error())
+		os.Exit(1)
+	}
 	midiReader.Start(cfg.MIDI.DeviceName, cfg.MIDI.ReconnectIntervalMs)
 
 	// 6. 事件总线

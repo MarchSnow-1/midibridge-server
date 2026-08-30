@@ -1,13 +1,15 @@
 package main
 
 import (
-golog "github.com/donnie4w/go-logger/logger"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"sync"
 	"time"
+
+	golog "github.com/donnie4w/go-logger/logger"
 )
 
 // maxBodySize HTTP 请求体的最大大小（10KB），防止内存攻击。
@@ -112,18 +114,25 @@ func NewAdminServer(cfg *Config, ws *WSServer, mr *MidiReader) *AdminServer {
 }
 
 // Start 启动 HTTP 管理服务器，注册路由并开始监听。
+// 监听器在本方法内同步创建，失败时立即返回错误（避免进程"假活"）。
 func (a *AdminServer) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/status", a.handleStatus)
 	mux.HandleFunc("/admin/change-password", a.handleChangePassword)
 
+	addr := a.cfg.Network.Bind + ":" + itoa(a.cfg.Admin.Port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to listen admin API on %s: %w", addr, err)
+	}
+
 	a.httpServer = &http.Server{
-		Addr:    a.cfg.Network.Bind + ":" + itoa(a.cfg.Admin.Port),
+		Addr:    addr,
 		Handler: mux,
 	}
 
 	go func() {
-		if err := a.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := a.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 			golog.Error("HTTP admin server error: " + err.Error())
 		}
 	}()
