@@ -16,6 +16,10 @@ import (
 // maxBodySize HTTP 请求体的最大大小（10KB），防止内存攻击。
 const maxBodySize = 10 * 1024
 
+// rateLimitMaxEntries 限速器条目表容量上限，防止海量不同源 IP 造成内存压力。
+// 达到上限时先清理过期条目，仍满则淘汰窗口最旧的条目。
+const rateLimitMaxEntries = 10000
+
 // rateLimiter 基于滑动窗口的 IP 速率限制器。
 // 每个 IP 在配置的时间窗口内最多允许 maxReqs 次请求，超出后整个窗口期间被封锁。
 type rateLimiter struct {
@@ -64,6 +68,13 @@ func (rl *rateLimiter) isLimited(ip string, windowMs, maxReqs int) bool {
 
 	// 新的 IP 或窗口已过期：创建新的统计窗口
 	if !ok || now.Sub(entry.windowStart) > window {
+		// 容量保护：先清理过期条目，仍满则淘汰窗口最旧的条目
+		if len(rl.entries) >= rateLimitMaxEntries {
+			rl.cleanupLocked(now)
+			if len(rl.entries) >= rateLimitMaxEntries {
+				rl.evictOldestLocked()
+			}
+		}
 		rl.entries[ip] = &rateEntry{
 			windowStart: now,
 			count:       1,
@@ -86,11 +97,33 @@ func (rl *rateLimiter) isLimited(ip string, windowMs, maxReqs int) bool {
 func (rl *rateLimiter) cleanup() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	cutoff := time.Now().Add(-120 * time.Second)
+	rl.cleanupLocked(time.Now())
+}
+
+// cleanupLocked 执行实际清理，调用方必须已持有 rl.mu。
+func (rl *rateLimiter) cleanupLocked(now time.Time) {
+	cutoff := now.Add(-120 * time.Second)
 	for ip, e := range rl.entries {
-		if e.windowStart.Before(cutoff) && e.blockedUntil.Before(time.Now()) {
+		if e.windowStart.Before(cutoff) && e.blockedUntil.Before(now) {
 			delete(rl.entries, ip)
 		}
+	}
+}
+
+// evictOldestLocked 淘汰窗口起始时间最旧的条目，调用方必须已持有 rl.mu。
+func (rl *rateLimiter) evictOldestLocked() {
+	var oldestIP string
+	var oldestTime time.Time
+	first := true
+	for ip, e := range rl.entries {
+		if first || e.windowStart.Before(oldestTime) {
+			oldestIP = ip
+			oldestTime = e.windowStart
+			first = false
+		}
+	}
+	if !first {
+		delete(rl.entries, oldestIP)
 	}
 }
 
