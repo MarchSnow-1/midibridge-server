@@ -137,8 +137,12 @@ func (a *AdminServer) Start() error {
 	}
 
 	a.httpServer = &http.Server{
-		Addr:    addr,
-		Handler: mux,
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second, // 防慢速头部占用（Slowloris 类）
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {
@@ -171,7 +175,8 @@ func clientIP(r *http.Request) string {
 }
 
 // handleStatus 返回服务端运行状态，包括在线客户端数、MIDI 连接状态
-// 和密码最后修改时间。受 IP 白名单约束，白名单检查先于任何响应（含 OPTIONS 预检）。
+// 和密码最后修改时间。仅接受 GET 请求，受 IP 白名单约束，白名单检查先于
+// 任何响应（含 OPTIONS 预检）。
 func (a *AdminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	setJSONContentType(w)
 
@@ -184,6 +189,12 @@ func (a *AdminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(204)
+		return
+	}
+
+	// 仅接受 GET，使注释承诺与实际行为一致
+	if r.Method != "GET" {
+		writeJSON(w, 405, map[string]string{"error": "Method not allowed"})
 		return
 	}
 
