@@ -366,12 +366,14 @@ func (s *WSServer) Broadcast(data MidiMessage) {
 }
 
 // KickAllClients 踢出当前所有连接的客户端。
-// 流程：发送 kicked 消息 → 关闭所有连接 → 清空客户端列表。
+// 流程：锁内快照并逐个 delete（不做整表替换——快照期间新注册的客户端
+// 不会被误除名成"孤儿"）→ 发送 kicked 消息 → 关闭连接。
 func (s *WSServer) KickAllClients(reason string) {
 	s.mu.Lock()
 	clients := make([]*WSClient, 0, len(s.clients))
 	for c := range s.clients {
 		clients = append(clients, c)
+		delete(s.clients, c)
 	}
 	s.mu.Unlock()
 
@@ -385,10 +387,6 @@ func (s *WSServer) KickAllClients(reason string) {
 		client.sendRaw(kickMsg)
 		client.conn.Close()
 	}
-
-	s.mu.Lock()
-	s.clients = make(map[*WSClient]struct{})
-	s.mu.Unlock()
 
 	golog.Info("Kicked all authenticated clients (" + reason + ")")
 }
