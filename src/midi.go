@@ -1,11 +1,13 @@
 package main
 
 import (
-golog "github.com/donnie4w/go-logger/logger"
+	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	golog "github.com/donnie4w/go-logger/logger"
 	"gitlab.com/gomidi/midi"
 	driver "gitlab.com/gomidi/rtmididrv"
 )
@@ -38,6 +40,11 @@ type MidiReader struct {
 
 	msgCh chan midiMsg // 内部消息 channel，Listener 回调写入，readLoop 消费
 
+	// 两级丢弃计数（atomic）：使"队列满导致的消息丢失"可观测，
+	// 由 dropMonitor 周期性汇总告警
+	droppedInCallback int64
+	droppedForward    int64
+
 	mu   sync.Mutex    // 保护 in、drv 和 shouldReconnect 的并发访问
 	done chan struct{} // 关闭信号——通知所有 goroutine 退出
 }
@@ -67,6 +74,27 @@ func (m *MidiReader) Start(deviceName string, reconnectIntervalMs int) {
 	m.reconnectInterval = time.Duration(reconnectIntervalMs) * time.Millisecond
 	m.shouldReconnect = true
 	go m.runLoop()
+	go m.dropMonitor()
+}
+
+// dropMonitor 周期性汇总两级队列的丢弃计数。若无此监控，
+// 队列满导致的 MIDI 消息丢失将完全不可见。
+func (m *MidiReader) dropMonitor() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.done:
+			return
+		case <-ticker.C:
+			if n := atomic.SwapInt64(&m.droppedInCallback, 0); n > 0 {
+				golog.Warn(fmt.Sprintf("Dropped %d MIDI message(s) in driver callback (internal queue full)", n))
+			}
+			if n := atomic.SwapInt64(&m.droppedForward, 0); n > 0 {
+				golog.Warn(fmt.Sprintf("Dropped %d MIDI message(s) while forwarding to broadcast (Msgs queue full)", n))
+			}
+		}
+	}
 }
 
 // Stop 发出停止信号，关闭 MIDI 端口和驱动，释放所有资源
@@ -201,7 +229,8 @@ func (m *MidiReader) tryConnect() bool {
 		select {
 		case m.msgCh <- midiMsg{data: msg, deltaSec: float64(deltaMicroseconds) / 1_000_000.0}:
 		default:
-			// channel 满时丢弃消息，避免阻塞 MIDI 驱动线程
+			// channel 满时丢弃消息，避免阻塞 MIDI 驱动线程（计数可观测）
+			atomic.AddInt64(&m.droppedInCallback, 1)
 		}
 	})
 
@@ -225,7 +254,8 @@ func (m *MidiReader) readLoop() {
 			select {
 			case m.Msgs <- MidiMessage{DeltaTime: msg.deltaSec, Data: msg.data}:
 			default:
-				// Msgs channel 满时丢弃，避免背压阻塞整个链条
+				// Msgs channel 满时丢弃，避免背压阻塞整个链条（计数可观测）
+				atomic.AddInt64(&m.droppedForward, 1)
 			}
 		case <-time.After(500 * time.Millisecond):
 			// 定期检查端口状态——如果设备物理断开，IsOpen() 会返回 false

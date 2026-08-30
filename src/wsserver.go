@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	golog "github.com/donnie4w/go-logger/logger"
@@ -43,15 +44,22 @@ var upgrader = websocket.Upgrader{
 type WSClient struct {
 	conn          *websocket.Conn // WebSocket 底层连接
 	authenticated bool            // 是否已通过密码认证
+	closed        bool            // 连接是否已进入清理流程（防止向已关闭的 send 队列投递）
 	ip            string          // 客户端 IP 地址（不含端口）
-	mu            sync.Mutex      // 保护 conn 写入和 authenticated 状态
+	send          chan []byte     // 广播消息发送队列（有界、单写协程消费以保证顺序）
+	mu            sync.Mutex      // 保护 conn 写入和 authenticated/closed 状态
 }
+
+// sendQueueSize 每个客户端的发送队列容量。
+// 满时丢弃最旧策略不可行（需保序），因此直接丢弃新帧并计数告警。
+const sendQueueSize = 256
 
 // WSServer 管理 WebSocket 连接的生命周期，包括认证、广播和踢出。
 // 内部维护一个已连接客户端的集合（无论是否认证）。
 type WSServer struct {
 	cfg        *Config                // 服务端配置引用
 	clients    map[*WSClient]struct{} // 当前所有连接的客户端集合
+	dropped    int64                  // 广播丢弃帧计数（atomic，由 dropMonitor 周期汇总）
 	mu         sync.Mutex             // 保护 clients 的并发访问
 	httpServer *http.Server           // 底层 HTTP 服务器
 	done       chan struct{}          // 停止信号
@@ -90,7 +98,35 @@ func (s *WSServer) Start() error {
 		}
 	}()
 
+	// 丢弃计数监控：使慢消费者导致的丢帧可观测
+	go s.dropMonitor()
+
 	return nil
+}
+
+// dropMonitor 周期性汇总广播丢弃计数。若无此监控，慢消费者导致的
+// MIDI 丢帧将完全不可见（两级静默丢弃）。
+func (s *WSServer) dropMonitor() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			if n := atomic.SwapInt64(&s.dropped, 0); n > 0 {
+				golog.Warn(fmt.Sprintf("Dropped %d MIDI broadcast frame(s) in the last 5s (slow client queues full)", n))
+			}
+		}
+	}
+}
+
+// writePump 是该客户端的唯一帧写入协程，按入队顺序串行发送，
+// 保证每个客户端收到的消息有序；队列在 readLoop 清理时关闭使本协程退出。
+func (s *WSServer) writePump(client *WSClient) {
+	for payload := range client.send {
+		client.sendRaw(payload)
+	}
 }
 
 // handleConnection 处理每个新进的 HTTP 请求。
@@ -128,6 +164,7 @@ func (s *WSServer) handleConnection(w http.ResponseWriter, r *http.Request) {
 		conn:          conn,
 		authenticated: false,
 		ip:            clientIP,
+		send:          make(chan []byte, sendQueueSize),
 	}
 
 	golog.Info("New client connected: " + clientIP)
@@ -136,6 +173,9 @@ func (s *WSServer) handleConnection(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.clients[client] = struct{}{}
 	s.mu.Unlock()
+
+	// 发送协程：单写者消费发送队列，保证该客户端收到的消息有序
+	go s.writePump(client)
 
 	// 心跳协程：周期性发送协议层 ping，发送失败即关闭死连接
 	stopHeartbeat := make(chan struct{})
@@ -192,6 +232,13 @@ func (s *WSServer) readLoop(client *WSClient, authTimer *time.Timer, stopHeartbe
 		authTimer.Stop()
 		close(stopHeartbeat)
 		client.conn.Close()
+		// 标记关闭并关闭发送队列，使 writePump 退出且后续投递被跳过
+		client.mu.Lock()
+		if !client.closed {
+			client.closed = true
+			close(client.send)
+		}
+		client.mu.Unlock()
 		s.removeClient(client)
 	}()
 
@@ -263,7 +310,9 @@ func (s *WSServer) removeClient(client *WSClient) {
 	s.mu.Unlock()
 }
 
-// Broadcast 将 MIDI 消息广播给所有已认证的客户端。
+// Broadcast 将 MIDI 消息非阻塞地投递给所有已认证客户端的发送队列。
+// 每个客户端由独立的 writePump 串行消费队列：单个慢/死客户端不再阻塞
+// 其他客户端与 MIDI 读取链；队列满时丢弃并计数（dropMonitor 周期告警）。
 func (s *WSServer) Broadcast(data MidiMessage) {
 	payload, _ := json.Marshal(map[string]interface{}{
 		"type": "midi",
@@ -277,7 +326,7 @@ func (s *WSServer) Broadcast(data MidiMessage) {
 	authedClients := make([]*WSClient, 0, len(s.clients))
 	for client := range s.clients {
 		client.mu.Lock()
-		if client.authenticated {
+		if client.authenticated && !client.closed {
 			authedClients = append(authedClients, client)
 		}
 		client.mu.Unlock()
@@ -285,7 +334,16 @@ func (s *WSServer) Broadcast(data MidiMessage) {
 	s.mu.Unlock()
 
 	for _, client := range authedClients {
-		client.sendRaw(payload)
+		client.mu.Lock()
+		if !client.closed {
+			select {
+			case client.send <- payload:
+			default:
+				// 该客户端队列已满（慢消费者）：丢弃本帧并计数，防止背压拖垮全局
+				atomic.AddInt64(&s.dropped, 1)
+			}
+		}
+		client.mu.Unlock()
 	}
 }
 
@@ -328,6 +386,7 @@ func (s *WSServer) ClientCount() int {
 func (s *WSServer) Stop() {
 	s.KickAllClients(kickServerShutdown)
 	s.httpServer.Close()
+	close(s.done)
 	golog.Info("WebSocket server stopped")
 }
 
@@ -343,6 +402,9 @@ func (c *WSClient) sendJSON(v interface{}) {
 func (c *WSClient) sendRaw(data []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
 	c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
 		golog.Warn("Failed to send to client " + c.ip + " error=" + err.Error() + " — closing connection")
