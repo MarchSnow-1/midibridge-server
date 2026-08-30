@@ -79,7 +79,7 @@ func main() {
 		golog.Error("Startup failed: " + err.Error())
 		os.Exit(1)
 	}
-	midiReader.Start(cfg.MIDI.DeviceName, cfg.MIDI.ReconnectIntervalMs)
+	midiReader.Start(cfg.MIDI.DeviceName, cfg.MIDI.ReconnectIntervalMs, cfg.MIDI.AutoReconnect)
 
 	// 6. 事件总线
 	// MIDI 消息 → WebSocket 广播给所有已认证客户端
