@@ -283,6 +283,10 @@ func (m *MidiReader) tryConnect() bool {
 // readLoop 从内部 msgCh 消费 MIDI 消息，将它们转发到对外 Msgs channel。
 // 同时每 500ms 检查一次端口是否仍处于打开状态，如果端口被拔出则返回让主循环进入重连流程。
 func (m *MidiReader) readLoop() {
+	// 定时器在循环外创建一次：避免 select 内 time.After 每轮产生新定时器
+	// 造成的高频分配与 GC 压力
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-m.done:
@@ -295,7 +299,7 @@ func (m *MidiReader) readLoop() {
 				// Msgs channel 满时丢弃，避免背压阻塞整个链条（计数可观测）
 				atomic.AddInt64(&m.droppedForward, 1)
 			}
-		case <-time.After(500 * time.Millisecond):
+		case <-ticker.C:
 			// 定期检查端口状态——如果设备物理断开，IsOpen() 会返回 false
 			m.mu.Lock()
 			open := m.in != nil && m.in.IsOpen()
