@@ -43,6 +43,7 @@ type WSServer struct {
 	clients    map[*WSClient]struct{} // 当前所有连接的客户端集合
 	dropped    int64                  // 广播丢弃帧计数（atomic，由 dropMonitor 周期汇总）
 	upgrader   websocket.Upgrader     // 带 Origin 校验的升级器
+	authGuard  *authGuard             // WS 认证失败限速/封禁守卫
 	mu         sync.Mutex             // 保护 clients 的并发访问
 	httpServer *http.Server           // 底层 HTTP 服务器
 	done       chan struct{}          // 停止信号
@@ -51,9 +52,10 @@ type WSServer struct {
 // NewWSServer 创建一个新的 WSServer 实例。需调用 Start() 才开始监听。
 func NewWSServer(cfg *Config) *WSServer {
 	s := &WSServer{
-		cfg:     cfg,
-		clients: make(map[*WSClient]struct{}),
-		done:    make(chan struct{}),
+		cfg:       cfg,
+		clients:   make(map[*WSClient]struct{}),
+		done:      make(chan struct{}),
+		authGuard: newAuthGuard(),
 	}
 	s.upgrader = websocket.Upgrader{
 		CheckOrigin: s.checkOrigin,
@@ -82,6 +84,95 @@ func (s *WSServer) checkOrigin(r *http.Request) bool {
 		return false
 	}
 	return true
+}
+
+// ===== WS 认证防爆破守卫 =====
+
+// WS 认证失败限速参数：按 IP 统计失败次数，超过阈值即临时封禁，
+// 防止在线爆破与"每次尝试一次 bcrypt"的 CPU 放大攻击。
+const (
+	wsAuthFailWindow = 60 * time.Second  // 失败计数窗口
+	wsAuthFailMax    = 5                 // 窗口内允许的最大失败次数
+	wsAuthBanTime    = 300 * time.Second // 触发后的封禁时长
+)
+
+// authGuard 按 IP 记录 WS 认证失败次数，超阈值即临时封禁。
+type authGuard struct {
+	mu    sync.Mutex
+	fails map[string]*authFailEntry
+}
+
+// authFailEntry 记录单个 IP 的认证失败统计与封禁状态。
+type authFailEntry struct {
+	count        int
+	windowStart  time.Time
+	blockedUntil time.Time
+}
+
+// newAuthGuard 创建守卫并启动过期条目清理协程（防止 fails 表无限增长）。
+func newAuthGuard() *authGuard {
+	g := &authGuard{fails: make(map[string]*authFailEntry)}
+	go g.cleanupLoop()
+	return g
+}
+
+// cleanupLoop 定期删除窗口过期且封禁到期的条目。
+func (g *authGuard) cleanupLoop() {
+	for {
+		time.Sleep(60 * time.Second)
+		now := time.Now()
+		g.mu.Lock()
+		for ip, e := range g.fails {
+			if e.blockedUntil.Before(now) && now.Sub(e.windowStart) > wsAuthFailWindow {
+				delete(g.fails, ip)
+			}
+		}
+		g.mu.Unlock()
+	}
+}
+
+// blocked 判断该 IP 是否处于封禁期，顺带清理过期窗口。
+func (g *authGuard) blocked(ip string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	e, ok := g.fails[ip]
+	if !ok {
+		return false
+	}
+	now := time.Now()
+	if e.blockedUntil.After(now) {
+		return true
+	}
+	if now.Sub(e.windowStart) > wsAuthFailWindow {
+		delete(g.fails, ip)
+	}
+	return false
+}
+
+// recordFailure 记录一次认证失败；超过阈值时实施封禁并返回 true。
+func (g *authGuard) recordFailure(ip string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := time.Now()
+	e, ok := g.fails[ip]
+	if !ok || now.Sub(e.windowStart) > wsAuthFailWindow {
+		g.fails[ip] = &authFailEntry{count: 1, windowStart: now}
+		return false
+	}
+	e.count++
+	if e.count > wsAuthFailMax && e.blockedUntil.Before(now) {
+		e.blockedUntil = now.Add(wsAuthBanTime)
+		golog.Warn("Too many WS auth failures, temporarily banning ip=" + ip)
+		return true
+	}
+	return false
+}
+
+// recordSuccess 认证成功后清除该 IP 的失败记录。
+func (g *authGuard) recordSuccess(ip string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.fails, ip)
 }
 
 // WSClient 表示一个已连接的 WebSocket 客户端。
@@ -325,6 +416,17 @@ func (s *WSServer) handleAuth(client *WSClient, msg map[string]interface{}, auth
 	}
 	client.mu.Unlock()
 
+	// 防爆破：该 IP 已因失败次数过多被临时封禁时直接拒绝，不进入 bcrypt
+	if s.authGuard.blocked(client.ip) {
+		golog.Warn("Rejected auth from temporarily banned ip=" + client.ip)
+		client.sendJSON(map[string]interface{}{
+			"type":   "auth_fail",
+			"reason": "Too many failed attempts, temporarily banned",
+		})
+		client.conn.Close()
+		return
+	}
+
 	password, _ := msg["password"].(string)
 	// 经读锁快照读取哈希，避免与改密写路径构成数据竞争
 	hash, _ := s.cfg.GetAuthSnapshot()
@@ -332,11 +434,13 @@ func (s *WSServer) handleAuth(client *WSClient, msg map[string]interface{}, auth
 		client.mu.Lock()
 		client.authenticated = true
 		client.mu.Unlock()
+		s.authGuard.recordSuccess(client.ip)
 		authTimer.Stop()
 		client.sendJSON(map[string]string{"type": "auth_ok"})
 		golog.Info("Client authenticated: " + client.ip)
 	} else {
 		golog.Warn("Client auth failed: " + client.ip)
+		s.authGuard.recordFailure(client.ip)
 		client.sendJSON(map[string]interface{}{
 			"type":   "auth_fail",
 			"reason": "Incorrect password",
