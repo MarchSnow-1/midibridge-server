@@ -22,6 +22,17 @@ const (
 // authTimeout 定义新连接必须在多长时间内完成认证，超时未认证将被踢出。
 const authTimeout = 5 * time.Second
 
+// maxFrameSize 限制单个 WebSocket 帧的最大字节数。
+// 协议仅有 auth/ping 等小消息，64KB 绰绰有余；
+// 防止恶意/异常客户端发送超大帧导致内存耗尽（gorilla 默认不限）。
+const maxFrameSize = 64 * 1024
+
+// wsPingInterval 服务端主动发送协议层 ping 的间隔。
+const wsPingInterval = 30 * time.Second
+
+// wsReadTimeout 读超时：超过该时间未收到任何帧（数据或 pong）即判定连接已死。
+const wsReadTimeout = 60 * time.Second
+
 // upgrader 将 HTTP 连接升级为 WebSocket，允许所有来源的跨域请求。
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
@@ -103,6 +114,15 @@ func (s *WSServer) handleConnection(w http.ResponseWriter, r *http.Request) {
 		golog.Warn("WebSocket upgrade failed ip=" + clientIP + " error=" + err.Error())
 		return
 	}
+	// 限制单帧大小，防止超大帧耗尽内存（必须在读取任何消息前设置）
+	conn.SetReadLimit(maxFrameSize)
+
+	// 读超时 + pong 续期：半开/死亡连接将在读超时后被 ReadMessage 检出并清理
+	conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+		return nil
+	})
 
 	client := &WSClient{
 		conn:          conn,
@@ -116,6 +136,10 @@ func (s *WSServer) handleConnection(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.clients[client] = struct{}{}
 	s.mu.Unlock()
+
+	// 心跳协程：周期性发送协议层 ping，发送失败即关闭死连接
+	stopHeartbeat := make(chan struct{})
+	go s.heartbeatLoop(client, stopHeartbeat)
 
 	// 认证超时定时器：5 秒内未完成认证则断开连接
 	authTimer := time.AfterFunc(authTimeout, func() {
@@ -133,13 +157,40 @@ func (s *WSServer) handleConnection(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 
-	s.readLoop(client, authTimer)
+	s.readLoop(client, authTimer, stopHeartbeat)
+}
+
+// heartbeatLoop 周期性向客户端发送 WebSocket 协议层 ping。
+// 若发送失败（对端已死/半开连接），主动关闭连接使 readLoop 退出并完成清理。
+// WriteControl 按 gorilla 约定可与 WriteMessage 并发，且自带截止时间参数。
+func (s *WSServer) heartbeatLoop(client *WSClient, stop chan struct{}) {
+	ticker := time.NewTicker(wsPingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			client.mu.Lock()
+			conn := client.conn
+			client.mu.Unlock()
+			if conn == nil {
+				return
+			}
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second)); err != nil {
+				golog.Warn("Ping failed, closing dead connection ip=" + client.ip + " error=" + err.Error())
+				conn.Close()
+				return
+			}
+		}
+	}
 }
 
 // readLoop 循环读取客户端消息，根据消息 type 分发到不同处理函数。
-func (s *WSServer) readLoop(client *WSClient, authTimer *time.Timer) {
+func (s *WSServer) readLoop(client *WSClient, authTimer *time.Timer, stopHeartbeat chan struct{}) {
 	defer func() {
 		authTimer.Stop()
+		close(stopHeartbeat)
 		client.conn.Close()
 		s.removeClient(client)
 	}()
@@ -287,11 +338,14 @@ func (c *WSClient) sendJSON(v interface{}) {
 }
 
 // sendRaw 向该客户端发送原始字节数据。
+// 写入失败（对端断开/超时）时立即关闭连接，唤醒阻塞中的 ReadMessage，
+// 让 readLoop 的 defer 统一完成客户端移除——死客户端不再滞留。
 func (c *WSClient) sendRaw(data []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
-		golog.Warn("Failed to send to client " + c.ip + " error=" + err.Error())
+		golog.Warn("Failed to send to client " + c.ip + " error=" + err.Error() + " — closing connection")
+		c.conn.Close()
 	}
 }
