@@ -181,9 +181,10 @@ type WSClient struct {
 	conn          *websocket.Conn // WebSocket 底层连接
 	authenticated bool            // 是否已通过密码认证
 	closed        bool            // 连接是否已进入清理流程（防止向已关闭的 send 队列投递）
+	kicked        bool            // 认证超时已触发踢出，禁止再完成认证（消除认证竞态窗口）
 	ip            string          // 客户端 IP 地址（不含端口）
 	send          chan []byte     // 广播消息发送队列（有界、单写协程消费以保证顺序）
-	mu            sync.Mutex      // 保护 conn 写入和 authenticated/closed 状态
+	mu            sync.Mutex      // 保护 conn 写入和 authenticated/closed/kicked 状态
 }
 
 // sendQueueSize 每个客户端的发送队列容量。
@@ -312,20 +313,25 @@ func (s *WSServer) handleConnection(w http.ResponseWriter, r *http.Request) {
 	stopHeartbeat := make(chan struct{})
 	go s.heartbeatLoop(client, stopHeartbeat)
 
-	// 认证超时定时器：5 秒内未完成认证则断开连接
+	// 认证超时定时器：5 秒内未完成认证则断开连接。
+	// 在同一把锁内判定并置 kicked 标志，与 handleAuth 的置位互斥，
+	// 消除"超时判定"与"认证成功"之间的竞态窗口（WS-9）。
 	authTimer := time.AfterFunc(authTimeout, func() {
 		client.mu.Lock()
-		authed := client.authenticated
-		client.mu.Unlock()
-		if !authed {
-			golog.Warn("Client " + clientIP + " auth timed out")
-			client.sendJSON(map[string]interface{}{
-				"type":   "kicked",
-				"reason": kickAuthTimeout,
-			})
-			client.conn.Close()
-			s.removeClient(client)
+		if client.authenticated || client.closed {
+			client.mu.Unlock()
+			return
 		}
+		client.kicked = true
+		client.mu.Unlock()
+
+		golog.Warn("Client " + clientIP + " auth timed out")
+		client.sendJSON(map[string]interface{}{
+			"type":   "kicked",
+			"reason": kickAuthTimeout,
+		})
+		client.conn.Close()
+		s.removeClient(client)
 	})
 
 	s.readLoop(client, authTimer, stopHeartbeat)
@@ -432,6 +438,11 @@ func (s *WSServer) handleAuth(client *WSClient, msg map[string]interface{}, auth
 	hash, _ := s.cfg.GetAuthSnapshot()
 	if verifyPassword(hash, password) {
 		client.mu.Lock()
+		// 若认证超时已触发踢出（kicked）或连接已关闭，则不得再置为已认证
+		if client.kicked || client.closed {
+			client.mu.Unlock()
+			return
+		}
 		client.authenticated = true
 		client.mu.Unlock()
 		s.authGuard.recordSuccess(client.ip)
