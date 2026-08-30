@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,9 +36,52 @@ const wsPingInterval = 30 * time.Second
 // wsReadTimeout 读超时：超过该时间未收到任何帧（数据或 pong）即判定连接已死。
 const wsReadTimeout = 60 * time.Second
 
-// upgrader 将 HTTP 连接升级为 WebSocket，允许所有来源的跨域请求。
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+// WSServer 管理 WebSocket 连接的生命周期，包括认证、广播和踢出。
+// 内部维护一个已连接客户端的集合（无论是否认证）。
+type WSServer struct {
+	cfg        *Config                // 服务端配置引用
+	clients    map[*WSClient]struct{} // 当前所有连接的客户端集合
+	dropped    int64                  // 广播丢弃帧计数（atomic，由 dropMonitor 周期汇总）
+	upgrader   websocket.Upgrader     // 带 Origin 校验的升级器
+	mu         sync.Mutex             // 保护 clients 的并发访问
+	httpServer *http.Server           // 底层 HTTP 服务器
+	done       chan struct{}          // 停止信号
+}
+
+// NewWSServer 创建一个新的 WSServer 实例。需调用 Start() 才开始监听。
+func NewWSServer(cfg *Config) *WSServer {
+	s := &WSServer{
+		cfg:     cfg,
+		clients: make(map[*WSClient]struct{}),
+		done:    make(chan struct{}),
+	}
+	s.upgrader = websocket.Upgrader{
+		CheckOrigin: s.checkOrigin,
+	}
+	return s
+}
+
+// checkOrigin 放行无 Origin 头的原生客户端（Go 客户端/安卓等），
+// 仅允许与请求 Host 同源的浏览器连接，拒绝其余跨域网页发起的
+// WebSocket 连接——阻断跨站 WebSocket 劫持（CSWSH）。
+func (s *WSServer) checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true // 原生客户端不发送 Origin 头
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := r.Host
+	if host == "" {
+		host = r.URL.Host
+	}
+	if u.Host != host {
+		golog.Warn("Rejected cross-origin WebSocket handshake: origin=" + origin + " host=" + host)
+		return false
+	}
+	return true
 }
 
 // WSClient 表示一个已连接的 WebSocket 客户端。
@@ -54,26 +98,6 @@ type WSClient struct {
 // sendQueueSize 每个客户端的发送队列容量。
 // 满时丢弃最旧策略不可行（需保序），因此直接丢弃新帧并计数告警。
 const sendQueueSize = 256
-
-// WSServer 管理 WebSocket 连接的生命周期，包括认证、广播和踢出。
-// 内部维护一个已连接客户端的集合（无论是否认证）。
-type WSServer struct {
-	cfg        *Config                // 服务端配置引用
-	clients    map[*WSClient]struct{} // 当前所有连接的客户端集合
-	dropped    int64                  // 广播丢弃帧计数（atomic，由 dropMonitor 周期汇总）
-	mu         sync.Mutex             // 保护 clients 的并发访问
-	httpServer *http.Server           // 底层 HTTP 服务器
-	done       chan struct{}          // 停止信号
-}
-
-// NewWSServer 创建一个新的 WSServer 实例。需调用 Start() 才开始监听。
-func NewWSServer(cfg *Config) *WSServer {
-	return &WSServer{
-		cfg:     cfg,
-		clients: make(map[*WSClient]struct{}),
-		done:    make(chan struct{}),
-	}
-}
 
 // Start 启动 WebSocket 服务器，在 cfg.WS.Port 上监听。
 // 监听器在本方法内同步创建，失败时立即返回错误（避免监听失败被后台
@@ -161,7 +185,7 @@ func (s *WSServer) handleConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		golog.Warn("WebSocket upgrade failed ip=" + clientIP + " error=" + err.Error())
 		return
