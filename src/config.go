@@ -1,7 +1,7 @@
 package main
 
 import (
-golog "github.com/donnie4w/go-logger/logger"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,11 +9,27 @@ golog "github.com/donnie4w/go-logger/logger"
 	"sync"
 	"time"
 
+	golog "github.com/donnie4w/go-logger/logger"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// defaultPassword 是首次运行时自动生成的初始密码，管理员应尽快修改。
-const defaultPassword = "midiBridge123"
+// initialPasswordLength 首次运行时生成的随机初始密码长度。
+const initialPasswordLength = 16
+
+// generateInitialPassword 使用加密安全随机数（crypto/rand）生成初始密码。
+// 字符集排除了易混淆字符（0/O、1/l/I）。生成的密码仅在首次启动时打印一次到控制台，
+// 不落日志文件、配置文件中只保存其 bcrypt 哈希。
+func generateInitialPassword() (string, error) {
+	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+	buf := make([]byte, initialPasswordLength)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("failed to generate random password: %w", err)
+	}
+	for i := range buf {
+		buf[i] = alphabet[int(buf[i])%len(alphabet)]
+	}
+	return string(buf), nil
+}
 
 // Config 是服务端全部配置的顶层结构，所有子配置直接嵌入 JSON 的顶层字段。
 // 内部包含一个读写锁和文件路径，用于线程安全的持久化操作。
@@ -99,18 +115,28 @@ func loadConfig(configPath string) (*Config, error) {
 	cfg.path = configPath
 
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		// 首次运行，生成默认配置
-		golog.Info("First run, generating default config...")
-		hash, err := bcrypt.GenerateFromPassword([]byte(defaultPassword), 10)
+		// 首次运行：生成随机初始密码并保存其哈希
+		golog.Info("First run, generating default config with a random initial password...")
+		initialPassword, err := generateInitialPassword()
 		if err != nil {
-			return nil, fmt.Errorf("failed to hash default password: %w", err)
+			return nil, err
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte(initialPassword), 10)
+		if err != nil {
+			return nil, fmt.Errorf("failed to hash initial password: %w", err)
 		}
 		cfg.Auth.PasswordHash = string(hash)
 		cfg.Auth.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 		if err := cfg.save(); err != nil {
 			return nil, err
 		}
-		golog.Warn("pls change default password: " + defaultPassword)
+		// 初始密码只打印到控制台一次（不走日志系统，避免落入日志文件）。
+		fmt.Println("==============================================================")
+		fmt.Println("  INITIAL ADMIN PASSWORD (printed only once):")
+		fmt.Println("  " + initialPassword)
+		fmt.Println("  Change it immediately via /admin/change-password")
+		fmt.Println("==============================================================")
+		golog.Warn("A random initial password was generated and printed to the console. Change it immediately.")
 		return &cfg, nil
 	}
 
