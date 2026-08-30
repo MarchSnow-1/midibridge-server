@@ -7,11 +7,23 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	golog "github.com/donnie4w/go-logger/logger"
 	"gitlab.com/gomidi/midi"
 	driver "gitlab.com/gomidi/rtmididrv"
 )
+
+// sanitizeLogValue 剥离控制字符（含 \r \n），防止恶意或异常的
+// MIDI 设备名在日志中伪造出新的日志行（日志注入）。
+func sanitizeLogValue(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)
+}
 
 // MidiMessage 表示一条 MIDI 消息，包含时间增量（秒）和原始 MIDI 数据字节
 type MidiMessage struct {
@@ -241,10 +253,10 @@ func (m *MidiReader) tryConnect() bool {
 		}
 		if target == nil {
 			// 未找到匹配设备，列出所有可用端口方便排查
-			golog.Error("not found target midi device: " + m.deviceName)
+			golog.Error("not found target midi device: " + sanitizeLogValue(m.deviceName))
 			golog.Error("Available devices:")
 			for _, in := range ins {
-				golog.Error("  [" + strconv.Itoa(in.Number()) + "] " + in.String())
+				golog.Error("  [" + strconv.Itoa(in.Number()) + "] " + sanitizeLogValue(in.String()))
 			}
 			return false
 		}
@@ -255,7 +267,7 @@ func (m *MidiReader) tryConnect() bool {
 
 	// 打开 MIDI 端口
 	if err := target.Open(); err != nil {
-		golog.Warn("Failed to open MIDI port port=" + target.String() + " error=" + err.Error())
+		golog.Warn("Failed to open MIDI port port=" + sanitizeLogValue(target.String()) + " error=" + err.Error())
 		return false
 	}
 
@@ -275,7 +287,7 @@ func (m *MidiReader) tryConnect() bool {
 
 	// 通知外部：设备已连接
 	select {
-	case m.Connects <- ConnectEvent{Index: target.Number(), Name: target.String()}:
+	case m.Connects <- ConnectEvent{Index: target.Number(), Name: sanitizeLogValue(target.String())}:
 	default:
 	}
 	return true
@@ -316,8 +328,9 @@ func (m *MidiReader) readLoop() {
 var noteNames = [12]string{"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"}
 
 // midiVerbose 将 MIDI 消息解析为人类可读的详细描述。
-// 仅处理通道消息（Note On/Off、CC、Program Change、Pitch Bend），
-// 系统消息返回空字符串（不记录）。
+// 解析常见通道消息（Note On/Off、CC、Program Change、Pitch Bend）；
+// 其余通道消息（0xA0 复音触后、0xD0 通道压力）与系统消息（0xF0-0xFF）
+// 返回空字符串（不记录）。
 func midiVerbose(data []byte) string {
 	if len(data) < 2 {
 		return ""
