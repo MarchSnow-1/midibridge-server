@@ -54,7 +54,7 @@ func initLogger(fileEnabled bool) {
 // canWriteToLogsDir 探测 logs 目录能否创建且可写。
 // 必须事前探测：go-logger v0.28.0 在打开日志文件失败后会将内部错误位置位
 // 且全库无复位路径，此后包括控制台在内的所有日志都会被永久静默丢弃
-//（运行期轮转重开失败同样触发）。绝不能把不可写的路径交给它。
+// （运行期轮转重开失败同样触发）。绝不能把不可写的路径交给它。
 func canWriteToLogsDir() bool {
 	dir := filepath.Join(".", "logs")
 	if err := os.MkdirAll(dir, 0755); err != nil {
