@@ -367,11 +367,11 @@ func midiVerbose(data []byte) string {
 		if len(data) < 3 {
 			return ""
 		}
-cc := int(data[1])
-			if cc == 123 || cc == 120 {
+		cc := int(data[1])
+		if cc == 123 || cc == 120 {
 			return ""
-			}
-			val := int(data[2])
+		}
+		val := int(data[2])
 		return "CH" + strconv.Itoa(channel) + " CC#" + strconv.Itoa(cc) + " = " + strconv.Itoa(val)
 
 	case 0xC0: // Program Change

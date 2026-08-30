@@ -85,7 +85,7 @@ type NetworkConfig struct {
 }
 
 // TLSConfig TLS 证书配置。两个路径同时配置时启用 TLS
-//（WebSocket 端口升级为 wss、管理端口升级为 https），任一为空则保持明文。
+// （WebSocket 端口升级为 wss、管理端口升级为 https），任一为空则保持明文。
 type TLSConfig struct {
 	Cert string `json:"cert"` // 证书文件路径（PEM）
 	Key  string `json:"key"`  // 私钥文件路径（PEM）
