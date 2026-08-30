@@ -1,13 +1,14 @@
 package main
 
 import (
-golog "github.com/donnie4w/go-logger/logger"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"sync"
 	"time"
 
+	golog "github.com/donnie4w/go-logger/logger"
 	"github.com/gorilla/websocket"
 )
 
@@ -55,18 +56,25 @@ func NewWSServer(cfg *Config) *WSServer {
 }
 
 // Start 启动 WebSocket 服务器，在 cfg.WS.Port 上监听。
-// 启动是非阻塞的——ListenAndServe 在后台 goroutine 中运行。
+// 监听器在本方法内同步创建，失败时立即返回错误（避免监听失败被后台
+// goroutine 静默吞掉、进程"假活"）。监听建立后由后台 goroutine 提供连接。
 func (s *WSServer) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleConnection)
 
+	addr := s.cfg.Network.Bind + ":" + itoa(s.cfg.WS.Port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to listen WebSocket on %s: %w", addr, err)
+	}
+
 	s.httpServer = &http.Server{
-		Addr:    s.cfg.Network.Bind + ":" + itoa(s.cfg.WS.Port),
+		Addr:    addr,
 		Handler: mux,
 	}
 
 	go func() {
-		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 			golog.Error("WebSocket server error: " + err.Error())
 		}
 	}()
