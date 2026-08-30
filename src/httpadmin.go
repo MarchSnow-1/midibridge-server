@@ -242,7 +242,7 @@ func (a *AdminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, 200, map[string]interface{}{
 		"status":              "running",
-		"connectedClients":    a.wsServer.ClientCount(),
+		"connectedClients":    a.wsServer.AuthenticatedClientCount(),
 		"midiConnected":       a.midiReader.IsConnected(),
 		"passwordLastUpdated": updatedAt,
 	})

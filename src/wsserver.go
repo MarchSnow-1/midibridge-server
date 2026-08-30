@@ -547,6 +547,23 @@ func (s *WSServer) ClientCount() int {
 	return len(s.clients)
 }
 
+// AuthenticatedClientCount 返回已通过认证的客户端数。
+// /admin/status 使用此口径，使"在线客户端"语义与实际能收到
+// MIDI 广播的客户端一致（不含尚未认证的连接）。
+func (s *WSServer) AuthenticatedClientCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for c := range s.clients {
+		c.mu.Lock()
+		if c.authenticated && !c.closed {
+			n++
+		}
+		c.mu.Unlock()
+	}
+	return n
+}
+
 // Stop 优雅关闭 WebSocket 服务器：先踢出所有客户端，再关闭 HTTP 监听器。
 // 判空保护：Start() 失败/未调用时 Stop() 不会 panic。
 func (s *WSServer) Stop() {
