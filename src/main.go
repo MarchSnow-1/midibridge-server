@@ -50,7 +50,11 @@ func main() {
 	// 3.5 暴露面警示：监听所有接口或白名单为空时，显著提醒管理员
 	bind := cfg.Network.Bind
 	if bind == "" || bind == "0.0.0.0" || bind == "::" {
-		golog.Warn("Listening on ALL network interfaces (transport is plaintext) — do not expose to untrusted networks")
+		if cfg.TLSEnabled() {
+			golog.Warn("Listening on ALL network interfaces (TLS enabled)")
+		} else {
+			golog.Warn("Listening on ALL network interfaces (transport is plaintext) — do not expose to untrusted networks")
+		}
 	}
 	if cfg.WS.AllowedIPs == "" {
 		golog.Warn("ws.allowedIPs is empty: ANY IP may connect to the WebSocket port")
@@ -108,8 +112,12 @@ func main() {
 	if displayBind == "" {
 		displayBind = "0.0.0.0"
 	}
-	golog.Info("WebSocket server: ws://" + displayBind + ":" + itoa(cfg.WS.Port))
-	golog.Info("HTTP admin API: http://" + displayBind + ":" + itoa(cfg.Admin.Port))
+	wsScheme, adminScheme := "ws", "http"
+	if cfg.TLSEnabled() {
+		wsScheme, adminScheme = "wss", "https"
+	}
+	golog.Info("WebSocket server: " + wsScheme + "://" + displayBind + ":" + itoa(cfg.WS.Port))
+	golog.Info("HTTP admin API: " + adminScheme + "://" + displayBind + ":" + itoa(cfg.Admin.Port))
 	deviceLabel := cfg.MIDI.DeviceName
 	if deviceLabel == "" {
 		deviceLabel = "(auto)"

@@ -40,6 +40,7 @@ type Config struct {
 	MIDI    MIDIConfig    `json:"midi"`
 	Logging LoggingConfig `json:"logging"`
 	Network NetworkConfig `json:"network"`
+	TLS     TLSConfig     `json:"tls"`
 
 	mu   sync.RWMutex // 保护配置字段的并发读写
 	path string       // config.json 的绝对路径
@@ -83,6 +84,18 @@ type NetworkConfig struct {
 	Bind string `json:"bind"` // 监听地址。为空表示监听所有网络接口
 }
 
+// TLSConfig TLS 证书配置。两个路径同时配置时启用 TLS
+//（WebSocket 端口升级为 wss、管理端口升级为 https），任一为空则保持明文。
+type TLSConfig struct {
+	Cert string `json:"cert"` // 证书文件路径（PEM）
+	Key  string `json:"key"`  // 私钥文件路径（PEM）
+}
+
+// TLSEnabled 返回是否同时配置了证书与私钥（即是否启用 TLS）。
+func (c *Config) TLSEnabled() bool {
+	return c.TLS.Cert != "" && c.TLS.Key != ""
+}
+
 // defaultConfig 返回一份带有合理默认值的全新 Config 实例。
 // 该函数不涉及任何 I/O 操作，仅构造数据结构。
 func defaultConfig() Config {
@@ -112,6 +125,10 @@ func defaultConfig() Config {
 		},
 		Network: NetworkConfig{
 			Bind: "",
+		},
+		TLS: TLSConfig{
+			Cert: "",
+			Key:  "",
 		},
 	}
 }
@@ -162,7 +179,7 @@ func loadConfig(configPath string) (*Config, error) {
 	// 避免安全关键配置因拼写错误而静默失效
 	var rawKeys map[string]json.RawMessage
 	if err := json.Unmarshal(data, &rawKeys); err == nil {
-		known := map[string]bool{"ws": true, "admin": true, "auth": true, "midi": true, "logging": true, "network": true}
+		known := map[string]bool{"ws": true, "admin": true, "auth": true, "midi": true, "logging": true, "network": true, "tls": true}
 		for k := range rawKeys {
 			if !known[k] {
 				golog.Warn("Unknown config key \"" + k + "\" ignored — check for typos")
@@ -199,6 +216,12 @@ func (c *Config) validate() {
 	if c.MIDI.ReconnectIntervalMs <= 0 {
 		golog.Warn(fmt.Sprintf("Invalid midi.reconnectIntervalMs %d, falling back to 3000", c.MIDI.ReconnectIntervalMs))
 		c.MIDI.ReconnectIntervalMs = 3000
+	}
+	// TLS 证书与私钥必须成对配置，只配其一视为无效并告警
+	if (c.TLS.Cert == "") != (c.TLS.Key == "") {
+		golog.Warn("tls.cert and tls.key must be configured together — TLS disabled")
+		c.TLS.Cert = ""
+		c.TLS.Key = ""
 	}
 }
 

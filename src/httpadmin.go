@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -126,14 +127,29 @@ func (a *AdminServer) Start() error {
 		return fmt.Errorf("failed to listen admin API on %s: %w", addr, err)
 	}
 
+	// 启用 TLS 前先同步验证证书可用，避免监听后异步失败导致"假活"
+	useTLS := a.cfg.TLSEnabled()
+	if useTLS {
+		if _, err := tls.LoadX509KeyPair(a.cfg.TLS.Cert, a.cfg.TLS.Key); err != nil {
+			ln.Close()
+			return fmt.Errorf("invalid TLS cert/key for admin API: %w", err)
+		}
+	}
+
 	a.httpServer = &http.Server{
 		Addr:    addr,
 		Handler: mux,
 	}
 
 	go func() {
-		if err := a.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
-			golog.Error("HTTP admin server error: " + err.Error())
+		var serveErr error
+		if useTLS {
+			serveErr = a.httpServer.ServeTLS(ln, a.cfg.TLS.Cert, a.cfg.TLS.Key)
+		} else {
+			serveErr = a.httpServer.Serve(ln)
+		}
+		if serveErr != nil && serveErr != http.ErrServerClosed {
+			golog.Error("HTTP admin server error: " + serveErr.Error())
 		}
 	}()
 
