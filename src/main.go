@@ -1,12 +1,14 @@
 package main
 
 import (
-golog "github.com/donnie4w/go-logger/logger"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
+
+	golog "github.com/donnie4w/go-logger/logger"
 )
 
 // version 在编译时通过 ldflags 注入，默认 "dev" 表示开发构建。
@@ -132,10 +134,27 @@ func main() {
 
 	golog.Info("Received " + sig.String() + ", shutting down...")
 
-	// 优雅关闭：先停 MIDI（断开硬件），再停 WebSocket（踢出客户端），最后停 HTTP
-	midiReader.Stop()
-	wsServer.Stop()
-	adminServer.Stop()
+	// 二次信号逃生门：关停过程若卡住，再按一次直接强制退出
+	go func() {
+		sig2 := <-sigCh
+		golog.Warn("Received " + sig2.String() + " again during shutdown — forcing exit")
+		os.Exit(1)
+	}()
 
-	golog.Info("Goodbye.")
+	// 带超时上限的优雅关闭：先停 MIDI（断开硬件），再停 WebSocket（踢出客户端），最后停 HTTP
+	shutdownDone := make(chan struct{})
+	go func() {
+		midiReader.Stop()
+		wsServer.Stop()
+		adminServer.Stop()
+		close(shutdownDone)
+	}()
+
+	select {
+	case <-shutdownDone:
+		golog.Info("Goodbye.")
+	case <-time.After(10 * time.Second):
+		golog.Error("Shutdown timed out after 10s — forcing exit")
+		os.Exit(1)
+	}
 }
