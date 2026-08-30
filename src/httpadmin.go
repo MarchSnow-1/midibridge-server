@@ -187,7 +187,8 @@ func (a *AdminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updatedAt := a.cfg.Auth.UpdatedAt
+	// 经读锁快照读取，避免与改密写路径构成数据竞争
+	_, updatedAt := a.cfg.GetAuthSnapshot()
 	if updatedAt == "" {
 		updatedAt = "N/A"
 	}
