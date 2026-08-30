@@ -226,9 +226,14 @@ func (c *Config) validate() {
 }
 
 // save 将当前配置以缩进格式写回磁盘。首次保存时自动创建 data 目录。
+// 安全性与健壮性：
+//   - 目录权限 0700、文件权限 0600（内含密码的 bcrypt 哈希，
+//     防止同机其他用户读取后离线爆破）
+//   - 先写临时文件再 rename 的原子替换：崩溃/断电不会留下半截 JSON
+//     导致下次启动无法加载配置
 func (c *Config) save() error {
 	dir := filepath.Dir(c.path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
 
@@ -237,7 +242,11 @@ func (c *Config) save() error {
 		return err
 	}
 
-	return os.WriteFile(c.path, data, 0644)
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, c.path)
 }
 
 // SetPasswordHash 更新密码哈希并立即持久化到磁盘。
