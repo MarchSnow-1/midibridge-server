@@ -146,18 +146,19 @@ func clientIP(r *http.Request) string {
 }
 
 // handleStatus 返回服务端运行状态，包括在线客户端数、MIDI 连接状态
-// 和密码最后修改时间。仅接受 GET 请求，受 IP 白名单约束。
+// 和密码最后修改时间。受 IP 白名单约束，白名单检查先于任何响应（含 OPTIONS 预检）。
 func (a *AdminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
-	setCORS(w)
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(204)
+	setJSONContentType(w)
+
+	ip := clientIP(r)
+	// IP 白名单检查（先于任何响应，包括 OPTIONS 预检）
+	if !isAllowed(ip, a.cfg.Admin.AllowedIPs) {
+		writeJSON(w, 403, map[string]string{"error": "Forbidden"})
 		return
 	}
 
-	ip := clientIP(r)
-	// IP 白名单检查
-	if !isAllowed(ip, a.cfg.Admin.AllowedIPs) {
-		writeJSON(w, 403, map[string]string{"error": "Forbidden"})
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(204)
 		return
 	}
 
@@ -176,9 +177,25 @@ func (a *AdminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // handleChangePassword 处理密码修改请求。
 // 安全流程：IP 白名单 → 速率限制 → 请求体大小限制 → JSON 解析 → 旧密码验证 → 新密码更新。
+// 白名单与速率限制先于任何响应（包括 OPTIONS 预检）。
 // 密码修改成功后，会踢出所有已认证的 WebSocket 客户端并断开它们的连接。
 func (a *AdminServer) handleChangePassword(w http.ResponseWriter, r *http.Request) {
-	setCORS(w)
+	setJSONContentType(w)
+
+	ip := clientIP(r)
+
+	// 1. IP 白名单（先于任何响应，包括 OPTIONS 预检）
+	if !isAllowed(ip, a.cfg.Admin.AllowedIPs) {
+		writeJSON(w, 403, map[string]string{"error": "Forbidden"})
+		return
+	}
+
+	// 2. 速率限制（先于任何响应，包括 OPTIONS 预检）
+	if a.limiter.isLimited(ip, a.cfg.Admin.RateLimitWindowMs, a.cfg.Admin.RateLimitMaxReqs) {
+		writeJSON(w, 429, map[string]string{"error": "Too many requests. Try again later."})
+		return
+	}
+
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(204)
 		return
@@ -186,20 +203,6 @@ func (a *AdminServer) handleChangePassword(w http.ResponseWriter, r *http.Reques
 
 	if r.Method != "POST" {
 		writeJSON(w, 405, map[string]string{"error": "Method not allowed"})
-		return
-	}
-
-	ip := clientIP(r)
-
-	// 1. IP 白名单
-	if !isAllowed(ip, a.cfg.Admin.AllowedIPs) {
-		writeJSON(w, 403, map[string]string{"error": "Forbidden"})
-		return
-	}
-
-	// 2. 速率限制
-	if a.limiter.isLimited(ip, a.cfg.Admin.RateLimitWindowMs, a.cfg.Admin.RateLimitMaxReqs) {
-		writeJSON(w, 429, map[string]string{"error": "Too many requests. Try again later."})
 		return
 	}
 
@@ -259,12 +262,11 @@ func (a *AdminServer) handleChangePassword(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// setCORS 设置跨域响应头和 Content-Type，使管理 API 可以从浏览器访问。
-func setCORS(w http.ResponseWriter) {
+// setJSONContentType 设置 JSON 响应的 Content-Type。
+// 不发送任何 CORS 头：管理 API 面向服务端工具调用，
+// 浏览器跨域请求将因预检失败被阻断（消除 ACAO:* 带来的跨域改密风险）。
+func setJSONContentType(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 }
 
 // writeJSON 以指定 HTTP 状态码返回 JSON 响应。
