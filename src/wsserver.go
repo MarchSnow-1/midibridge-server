@@ -334,7 +334,7 @@ func (s *WSServer) handleConnection(w http.ResponseWriter, r *http.Request) {
 			"type":   "kicked",
 			"reason": kickAuthTimeout,
 		})
-		client.conn.Close()
+		client.closeGracefully(websocket.ClosePolicyViolation, "auth timeout")
 		s.removeClient(client)
 	})
 
@@ -433,7 +433,7 @@ func (s *WSServer) handleAuth(client *WSClient, msg map[string]interface{}, auth
 			"type":   "auth_fail",
 			"reason": "Too many failed attempts, temporarily banned",
 		})
-		client.conn.Close()
+		client.closeGracefully(websocket.ClosePolicyViolation, "too many failed attempts")
 		return
 	}
 
@@ -460,7 +460,7 @@ func (s *WSServer) handleAuth(client *WSClient, msg map[string]interface{}, auth
 			"type":   "auth_fail",
 			"reason": "Incorrect password",
 		})
-		client.conn.Close()
+		client.closeGracefully(websocket.ClosePolicyViolation, "auth failed")
 	}
 }
 
@@ -525,10 +525,16 @@ func (s *WSServer) KickAllClients(reason string) {
 		"reason": reason,
 	})
 
+	// 关闭帧编码：服务器关停 = 1001 Going Away；其余（改密等）= 1008 Policy Violation
+	closeCode := websocket.ClosePolicyViolation
+	if reason == kickServerShutdown {
+		closeCode = websocket.CloseGoingAway
+	}
+
 	// 发 kicked 通知并关闭连接
 	for _, client := range clients {
 		client.sendRaw(kickMsg)
-		client.conn.Close()
+		client.closeGracefully(closeCode, reason)
 	}
 
 	golog.Info("Kicked all authenticated clients (" + reason + ")")
@@ -572,4 +578,20 @@ func (c *WSClient) sendRaw(data []byte) {
 		golog.Warn("Failed to send to client " + c.ip + " error=" + err.Error() + " — closing connection")
 		c.conn.Close()
 	}
+}
+
+// closeGracefully 在断开前发送标准 WebSocket 关闭帧（RFC 6455 关闭握手），
+// 再关闭底层连接；关闭帧发送失败不阻塞关闭本身。
+// 客户端因此能观察到正常关闭码，而非一律视为 1006 异常断开。
+func (c *WSClient) closeGracefully(code int, reason string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	deadline := time.Now().Add(1 * time.Second)
+	msg := websocket.FormatCloseMessage(code, reason)
+	// WriteControl 按 gorilla 约定可与其他方法并发，且自带截止时间
+	c.conn.WriteControl(websocket.CloseMessage, msg, deadline)
+	c.conn.Close()
 }
