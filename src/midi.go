@@ -1,14 +1,29 @@
 package main
 
 import (
-golog "github.com/donnie4w/go-logger/logger"
+	"fmt"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode"
 
+	golog "github.com/donnie4w/go-logger/logger"
 	"gitlab.com/gomidi/midi"
 	driver "gitlab.com/gomidi/rtmididrv"
 )
+
+// sanitizeLogValue 剥离控制字符（含 \r \n），防止恶意或异常的
+// MIDI 设备名在日志中伪造出新的日志行（日志注入）。
+func sanitizeLogValue(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)
+}
 
 // MidiMessage 表示一条 MIDI 消息，包含时间增量（秒）和原始 MIDI 数据字节
 type MidiMessage struct {
@@ -38,8 +53,15 @@ type MidiReader struct {
 
 	msgCh chan midiMsg // 内部消息 channel，Listener 回调写入，readLoop 消费
 
-	mu   sync.Mutex    // 保护 in、drv 和 shouldReconnect 的并发访问
-	done chan struct{} // 关闭信号——通知所有 goroutine 退出
+	// 两级丢弃计数（atomic）：使"队列满导致的消息丢失"可观测，
+	// 由 dropMonitor 周期性汇总告警
+	droppedInCallback int64
+	droppedForward    int64
+
+	mu       sync.Mutex    // 保护 in、drv 和 shouldReconnect 的并发访问
+	done     chan struct{} // 关闭信号——通知所有 goroutine 退出
+	stopped  bool          // Stop 幂等标志
+	loopDone chan struct{} // runLoop 完全退出后关闭，用于 Stop 的关闭顺序控制
 }
 
 // midiMsg 是内部使用的轻量级消息结构，避免暴露 Listener 的 deltaMicroseconds 参数
@@ -60,25 +82,61 @@ func NewMidiReader() *MidiReader {
 	}
 }
 
-// Start 设置目标设备名和重连参数，然后启动后台主循环
-// deviceName 为空字符串时，回退到使用系统首个 MIDI 输入端口
-func (m *MidiReader) Start(deviceName string, reconnectIntervalMs int) {
+// Start 设置目标设备名和重连参数，然后启动后台主循环。
+// autoReconnect=false 时：仍会做一次初始连接尝试，但失败或设备断开后不再重连。
+// deviceName 为空字符串时，回退到使用系统首个 MIDI 输入端口。
+func (m *MidiReader) Start(deviceName string, reconnectIntervalMs int, autoReconnect bool) {
 	m.deviceName = deviceName
 	m.reconnectInterval = time.Duration(reconnectIntervalMs) * time.Millisecond
-	m.shouldReconnect = true
-	go m.runLoop()
+	m.shouldReconnect = autoReconnect
+	m.loopDone = make(chan struct{})
+	go func() {
+		m.runLoop()
+		close(m.loopDone)
+	}()
+	go m.dropMonitor()
 }
 
-// Stop 发出停止信号，关闭 MIDI 端口和驱动，释放所有资源
-// 该方法是幂等的 多次调用不会 panic
+// dropMonitor 周期性汇总两级队列的丢弃计数。若无此监控，
+// 队列满导致的 MIDI 消息丢失将完全不可见。
+func (m *MidiReader) dropMonitor() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.done:
+			return
+		case <-ticker.C:
+			if n := atomic.SwapInt64(&m.droppedInCallback, 0); n > 0 {
+				golog.Warn(fmt.Sprintf("Dropped %d MIDI message(s) in driver callback (internal queue full)", n))
+			}
+			if n := atomic.SwapInt64(&m.droppedForward, 0); n > 0 {
+				golog.Warn(fmt.Sprintf("Dropped %d MIDI message(s) while forwarding to broadcast (Msgs queue full)", n))
+			}
+		}
+	}
+}
+
+// Stop 发出停止信号，关闭 MIDI 端口和驱动，释放所有资源。
+// 该方法是幂等的，多次调用不会 panic。
+// 关闭顺序：发停止信号 → 关硬件 → 等待主循环（含 readLoop）完全退出 →
+// 关闭对外暴露的 channel（Msgs/Connects/Disconnects），使 main 中的
+// 消费协程（for range）能正常终止。内部 msgCh 永不关闭——
+// 驱动回调可能在关停瞬间仍在投递，关闭它会引发 send-on-closed panic。
 func (m *MidiReader) Stop() {
 	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		return
+	}
+	m.stopped = true
 	m.shouldReconnect = false
+	loopDone := m.loopDone
 	m.mu.Unlock()
+
 	close(m.done)
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.in != nil && m.in.IsOpen() {
 		m.in.Close()
 		m.in = nil
@@ -86,6 +144,22 @@ func (m *MidiReader) Stop() {
 	if m.drv != nil {
 		m.drv.Close()
 		m.drv = nil
+	}
+	m.mu.Unlock()
+
+	// 等待主循环（含 readLoop）完全退出，之后再关闭对外 channel，
+	// 杜绝向已关闭 channel 发送的窗口。
+	// 超时后不关闭 channel——驱动回调可能仍在运行，
+	// 向已关闭 channel 发送会 panic。进程即将退出，泄漏可接受。
+	if loopDone != nil {
+		select {
+		case <-loopDone:
+			close(m.Msgs)
+			close(m.Connects)
+			close(m.Disconnects)
+		case <-time.After(5 * time.Second):
+			golog.Warn("Timed out waiting for MIDI loop to exit — channels left open (process exiting)")
+		}
 	}
 	golog.Info("MIDI reader stopped")
 }
@@ -97,21 +171,15 @@ func (m *MidiReader) IsConnected() bool {
 	return m.in != nil && m.in.IsOpen()
 }
 
-// runLoop 主循环，不断执行 tryConnect → readLoop → 等待 → 重连的过程
-// 只要 shouldReconnect 为 true 且 done 未关闭，就会一直循环
+// runLoop 主循环：连接设备 → readLoop 阻塞读取 → 断开后按配置决定是否重连。
+// 首次连接尝试总是执行；其后仅在 shouldReconnect 为 true 时继续重试，
+// 只要 done 未关闭就一直循环。
 func (m *MidiReader) runLoop() {
 	for {
 		select {
 		case <-m.done:
 			return
 		default:
-		}
-
-		m.mu.Lock()
-		reconnect := m.shouldReconnect
-		m.mu.Unlock()
-		if !reconnect {
-			return
 		}
 
 		connected := m.tryConnect()
@@ -123,6 +191,19 @@ func (m *MidiReader) runLoop() {
 			case m.Disconnects <- struct{}{}:
 			default:
 			}
+		}
+
+		// 断开或连接失败后：按配置决定是否继续重连
+		m.mu.Lock()
+		reconnect := m.shouldReconnect
+		m.mu.Unlock()
+		if !reconnect {
+			if !connected {
+				golog.Warn("MIDI connection failed and autoReconnect is disabled — giving up")
+			} else {
+				golog.Info("MIDI device disconnected and autoReconnect is disabled — stopping")
+			}
+			return
 		}
 
 		// 等待重连间隔（同时监听 done 以便快速退出）
@@ -174,10 +255,10 @@ func (m *MidiReader) tryConnect() bool {
 		}
 		if target == nil {
 			// 未找到匹配设备，列出所有可用端口方便排查
-			golog.Error("not found target midi device: " + m.deviceName)
+			golog.Error("not found target midi device: " + sanitizeLogValue(m.deviceName))
 			golog.Error("Available devices:")
 			for _, in := range ins {
-				golog.Error("  [" + itoa(in.Number()) + "] " + in.String())
+				golog.Error("  [" + strconv.Itoa(in.Number()) + "] " + sanitizeLogValue(in.String()))
 			}
 			return false
 		}
@@ -188,7 +269,7 @@ func (m *MidiReader) tryConnect() bool {
 
 	// 打开 MIDI 端口
 	if err := target.Open(); err != nil {
-		golog.Warn("Failed to open MIDI port port=" + target.String() + " error=" + err.Error())
+		golog.Warn("Failed to open MIDI port port=" + sanitizeLogValue(target.String()) + " error=" + err.Error())
 		return false
 	}
 
@@ -201,13 +282,14 @@ func (m *MidiReader) tryConnect() bool {
 		select {
 		case m.msgCh <- midiMsg{data: msg, deltaSec: float64(deltaMicroseconds) / 1_000_000.0}:
 		default:
-			// channel 满时丢弃消息，避免阻塞 MIDI 驱动线程
+			// channel 满时丢弃消息，避免阻塞 MIDI 驱动线程（计数可观测）
+			atomic.AddInt64(&m.droppedInCallback, 1)
 		}
 	})
 
 	// 通知外部：设备已连接
 	select {
-	case m.Connects <- ConnectEvent{Index: target.Number(), Name: target.String()}:
+	case m.Connects <- ConnectEvent{Index: target.Number(), Name: sanitizeLogValue(target.String())}:
 	default:
 	}
 	return true
@@ -216,6 +298,10 @@ func (m *MidiReader) tryConnect() bool {
 // readLoop 从内部 msgCh 消费 MIDI 消息，将它们转发到对外 Msgs channel。
 // 同时每 500ms 检查一次端口是否仍处于打开状态，如果端口被拔出则返回让主循环进入重连流程。
 func (m *MidiReader) readLoop() {
+	// 定时器在循环外创建一次：避免 select 内 time.After 每轮产生新定时器
+	// 造成的高频分配与 GC 压力
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-m.done:
@@ -225,9 +311,10 @@ func (m *MidiReader) readLoop() {
 			select {
 			case m.Msgs <- MidiMessage{DeltaTime: msg.deltaSec, Data: msg.data}:
 			default:
-				// Msgs channel 满时丢弃，避免背压阻塞整个链条
+				// Msgs channel 满时丢弃，避免背压阻塞整个链条（计数可观测）
+				atomic.AddInt64(&m.droppedForward, 1)
 			}
-		case <-time.After(500 * time.Millisecond):
+		case <-ticker.C:
 			// 定期检查端口状态——如果设备物理断开，IsOpen() 会返回 false
 			m.mu.Lock()
 			open := m.in != nil && m.in.IsOpen()
@@ -239,26 +326,13 @@ func (m *MidiReader) readLoop() {
 	}
 }
 
-// itoa 是将整数转为字符串的轻量实现，避免引入 strconv 或 fmt 的包
-// 仅在 MIDI 端口号和日志输出中使用，输入值范围为 0~65535
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	s := ""
-	for i > 0 {
-		s = string(rune('0'+i%10)) + s
-		i /= 10
-	}
-	return s
-}
-
 // 音符名称映射（MIDI 音符编号 mod 12）
 var noteNames = [12]string{"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"}
 
 // midiVerbose 将 MIDI 消息解析为人类可读的详细描述。
-// 仅处理通道消息（Note On/Off、CC、Program Change、Pitch Bend），
-// 系统消息返回空字符串（不记录）。
+// 解析常见通道消息（Note On/Off、CC、Program Change、Pitch Bend）；
+// 其余通道消息（0xA0 复音触后、0xD0 通道压力）与系统消息（0xF0-0xFF）
+// 返回空字符串（不记录）。
 func midiVerbose(data []byte) string {
 	if len(data) < 2 {
 		return ""
@@ -276,7 +350,7 @@ func midiVerbose(data []byte) string {
 		vel := int(data[2])
 		oct := int(note/12) - 1
 		name := noteNames[note%12]
-		return "CH" + itoa(channel) + " Note Off: " + name + itoa(oct) + " vel=" + itoa(vel)
+		return "CH" + strconv.Itoa(channel) + " Note Off: " + name + strconv.Itoa(oct) + " vel=" + strconv.Itoa(vel)
 
 	case 0x90: // Note On (velocity=0 视为 Note Off)
 		if len(data) < 3 {
@@ -287,24 +361,24 @@ func midiVerbose(data []byte) string {
 		oct := int(note/12) - 1
 		name := noteNames[note%12]
 		if vel == 0 {
-			return "CH" + itoa(channel) + " Note Off: " + name + itoa(oct) + " (vel=0)"
+			return "CH" + strconv.Itoa(channel) + " Note Off: " + name + strconv.Itoa(oct) + " (vel=0)"
 		}
-		return "CH" + itoa(channel) + " Note On:  " + name + itoa(oct) + " vel=" + itoa(vel)
+		return "CH" + strconv.Itoa(channel) + " Note On:  " + name + strconv.Itoa(oct) + " vel=" + strconv.Itoa(vel)
 
 	case 0xB0: // Control Change
 		if len(data) < 3 {
 			return ""
 		}
-cc := int(data[1])
-			if cc == 123 || cc == 120 {
+		cc := int(data[1])
+		if cc == 123 || cc == 120 {
 			return ""
-			}
-			val := int(data[2])
-		return "CH" + itoa(channel) + " CC#" + itoa(cc) + " = " + itoa(val)
+		}
+		val := int(data[2])
+		return "CH" + strconv.Itoa(channel) + " CC#" + strconv.Itoa(cc) + " = " + strconv.Itoa(val)
 
 	case 0xC0: // Program Change
 		prog := int(data[1])
-		return "CH" + itoa(channel) + " Program: " + itoa(prog)
+		return "CH" + strconv.Itoa(channel) + " Program: " + strconv.Itoa(prog)
 
 	case 0xE0: // Pitch Bend
 		if len(data) < 3 {
@@ -313,7 +387,7 @@ cc := int(data[1])
 		lsb := int(data[1])
 		msb := int(data[2])
 		val := (msb<<7 | lsb) - 8192 // 居中为 0
-		return "CH" + itoa(channel) + " Pitch: " + itoa(val)
+		return "CH" + strconv.Itoa(channel) + " Pitch: " + strconv.Itoa(val)
 	}
 	return "" // 系统消息不记录
 }

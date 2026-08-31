@@ -1,17 +1,26 @@
 package main
 
 import (
-golog "github.com/donnie4w/go-logger/logger"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 
+	golog "github.com/donnie4w/go-logger/logger"
 	"golang.org/x/crypto/bcrypt"
 )
 
+// minPasswordLen 新密码的最小长度（按 Unicode 字符计，而非字节）。
+const minPasswordLen = 8
+
+// maxPasswordBytes bcrypt 的有效输入上限（超出部分会被静默截断）。
+const maxPasswordBytes = 72
+
 // 密码操作相关错误定义，供 httpadmin.go 区分不同的失败原因。
+// 注意：这些文案只用于服务端日志，对外响应使用统一通用文案（避免信息泄露）。
 var (
 	errOldPasswordIncorrect = errors.New("Old password is incorrect")
-	errPasswordTooShort     = errors.New("New password must be at least 6 characters")
+	errPasswordTooShort     = errors.New("New password is too short")
+	errPasswordTooLong      = errors.New("New password exceeds bcrypt limit")
 )
 
 // verifyPassword 使用 bcrypt 比对明文密码与存储的哈希值。
@@ -28,17 +37,25 @@ func verifyPassword(hash, plainPassword string) bool {
 // changePassword 验证旧密码后更新为新密码并持久化到配置文件。
 // 安全规则：
 //   - 旧密码必须正确
-//   - 新密码至少 6 个字符
+//   - 新密码至少 8 个 Unicode 字符（按字符计而非字节），且不超过 72 字节
 //   - bcrypt cost factor = 10（在合理安全性和性能之间取得平衡）
+//   - "验证旧密码→写入新哈希"全程持有写锁，与并发读快照互斥
 func changePassword(cfg *Config, oldPassword, newPassword string) error {
-	// 第一步：验证旧密码
-	if !verifyPassword(cfg.Auth.PasswordHash, oldPassword) {
-		return errOldPasswordIncorrect
+	// 第一步：新密码格式检查（无需持锁；对外响应统一，不泄露校验顺序）
+	if utf8.RuneCountInString(newPassword) < minPasswordLen {
+		return errPasswordTooShort
+	}
+	// 超过 72 字节的部分会被 bcrypt 静默截断，显式拒绝避免误导
+	if len(newPassword) > maxPasswordBytes {
+		return errPasswordTooLong
 	}
 
-	// 第二步：新密码长度检查
-	if len(newPassword) < 6 {
-		return errPasswordTooShort
+	// 第二步：全程持写锁，保证并发改密/并发读快照的原子性与可见性
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+
+	if !verifyPassword(cfg.Auth.PasswordHash, oldPassword) {
+		return errOldPasswordIncorrect
 	}
 
 	// 第三步：生成 bcrypt 哈希
@@ -47,8 +64,8 @@ func changePassword(cfg *Config, oldPassword, newPassword string) error {
 		return fmt.Errorf("failed to hash new password: %w", err)
 	}
 
-	// 第四步：持久化新哈希到配置文件
-	if err := cfg.SetPasswordHash(string(hash)); err != nil {
+	// 第四步：持久化新哈希到配置文件（锁内完成，避免中间态）
+	if err := cfg.setPasswordHashLocked(string(hash)); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 

@@ -1,17 +1,25 @@
 package main
 
 import (
-golog "github.com/donnie4w/go-logger/logger"
+	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
+
+	golog "github.com/donnie4w/go-logger/logger"
 )
 
 // maxBodySize HTTP 请求体的最大大小（10KB），防止内存攻击。
 const maxBodySize = 10 * 1024
+
+// rateLimitMaxEntries 限速器条目表容量上限，防止海量不同源 IP 造成内存压力。
+// 达到上限时先清理过期条目，仍满则淘汰窗口最旧的条目。
+const rateLimitMaxEntries = 10000
 
 // rateLimiter 基于滑动窗口的 IP 速率限制器。
 // 每个 IP 在配置的时间窗口内最多允许 maxReqs 次请求，超出后整个窗口期间被封锁。
@@ -61,6 +69,13 @@ func (rl *rateLimiter) isLimited(ip string, windowMs, maxReqs int) bool {
 
 	// 新的 IP 或窗口已过期：创建新的统计窗口
 	if !ok || now.Sub(entry.windowStart) > window {
+		// 容量保护：先清理过期条目，仍满则淘汰窗口最旧的条目
+		if len(rl.entries) >= rateLimitMaxEntries {
+			rl.cleanupLocked(now)
+			if len(rl.entries) >= rateLimitMaxEntries {
+				rl.evictOldestLocked()
+			}
+		}
 		rl.entries[ip] = &rateEntry{
 			windowStart: now,
 			count:       1,
@@ -83,11 +98,33 @@ func (rl *rateLimiter) isLimited(ip string, windowMs, maxReqs int) bool {
 func (rl *rateLimiter) cleanup() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	cutoff := time.Now().Add(-120 * time.Second)
+	rl.cleanupLocked(time.Now())
+}
+
+// cleanupLocked 执行实际清理，调用方必须已持有 rl.mu。
+func (rl *rateLimiter) cleanupLocked(now time.Time) {
+	cutoff := now.Add(-120 * time.Second)
 	for ip, e := range rl.entries {
-		if e.windowStart.Before(cutoff) && e.blockedUntil.Before(time.Now()) {
+		if e.windowStart.Before(cutoff) && e.blockedUntil.Before(now) {
 			delete(rl.entries, ip)
 		}
+	}
+}
+
+// evictOldestLocked 淘汰窗口起始时间最旧的条目，调用方必须已持有 rl.mu。
+func (rl *rateLimiter) evictOldestLocked() {
+	var oldestIP string
+	var oldestTime time.Time
+	first := true
+	for ip, e := range rl.entries {
+		if first || e.windowStart.Before(oldestTime) {
+			oldestIP = ip
+			oldestTime = e.windowStart
+			first = false
+		}
+	}
+	if !first {
+		delete(rl.entries, oldestIP)
 	}
 }
 
@@ -112,28 +149,56 @@ func NewAdminServer(cfg *Config, ws *WSServer, mr *MidiReader) *AdminServer {
 }
 
 // Start 启动 HTTP 管理服务器，注册路由并开始监听。
+// 监听器在本方法内同步创建，失败时立即返回错误（避免进程"假活"）。
 func (a *AdminServer) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/status", a.handleStatus)
 	mux.HandleFunc("/admin/change-password", a.handleChangePassword)
 
+	addr := net.JoinHostPort(a.cfg.Network.Bind, strconv.Itoa(a.cfg.Admin.Port))
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to listen admin API on %s: %w", addr, err)
+	}
+
+	// 启用 TLS 前先同步验证证书可用，避免监听后异步失败导致"假活"
+	useTLS := a.cfg.TLSEnabled()
+	if useTLS {
+		if _, err := tls.LoadX509KeyPair(a.cfg.TLS.Cert, a.cfg.TLS.Key); err != nil {
+			ln.Close()
+			return fmt.Errorf("invalid TLS cert/key for admin API: %w", err)
+		}
+	}
+
 	a.httpServer = &http.Server{
-		Addr:    ":" + itoa(a.cfg.Admin.Port),
-		Handler: mux,
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second, // 防慢速头部占用（Slowloris 类）
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {
-		if err := a.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			golog.Error("HTTP admin server error: " + err.Error())
+		var serveErr error
+		if useTLS {
+			serveErr = a.httpServer.ServeTLS(ln, a.cfg.TLS.Cert, a.cfg.TLS.Key)
+		} else {
+			serveErr = a.httpServer.Serve(ln)
+		}
+		if serveErr != nil && serveErr != http.ErrServerClosed {
+			golog.Error("HTTP admin server error: " + serveErr.Error())
 		}
 	}()
 
 	return nil
 }
 
-// Stop 关闭 HTTP 管理服务器。
+// Stop 关闭 HTTP 管理服务器。判空保护：Start() 失败/未调用时不会 panic。
 func (a *AdminServer) Stop() {
-	a.httpServer.Close()
+	if a.httpServer != nil {
+		a.httpServer.Close()
+	}
 }
 
 // clientIP 从 http.Request 中提取客户端真实 IP，去除端口号。
@@ -146,29 +211,38 @@ func clientIP(r *http.Request) string {
 }
 
 // handleStatus 返回服务端运行状态，包括在线客户端数、MIDI 连接状态
-// 和密码最后修改时间。仅接受 GET 请求，受 IP 白名单约束。
+// 和密码最后修改时间。仅接受 GET 请求，受 IP 白名单约束，白名单检查先于
+// 任何响应（含 OPTIONS 预检）。
 func (a *AdminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
-	setCORS(w)
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(204)
-		return
-	}
+	setJSONContentType(w)
 
 	ip := clientIP(r)
-	// IP 白名单检查
+	// IP 白名单检查（先于任何响应，包括 OPTIONS 预检）
 	if !isAllowed(ip, a.cfg.Admin.AllowedIPs) {
 		writeJSON(w, 403, map[string]string{"error": "Forbidden"})
 		return
 	}
 
-	updatedAt := a.cfg.Auth.UpdatedAt
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(204)
+		return
+	}
+
+	// 仅接受 GET，使注释承诺与实际行为一致
+	if r.Method != "GET" {
+		writeJSON(w, 405, map[string]string{"error": "Method not allowed"})
+		return
+	}
+
+	// 经读锁快照读取，避免与改密写路径构成数据竞争
+	_, updatedAt := a.cfg.GetAuthSnapshot()
 	if updatedAt == "" {
 		updatedAt = "N/A"
 	}
 
 	writeJSON(w, 200, map[string]interface{}{
 		"status":              "running",
-		"connectedClients":    a.wsServer.ClientCount(),
+		"connectedClients":    a.wsServer.AuthenticatedClientCount(),
 		"midiConnected":       a.midiReader.IsConnected(),
 		"passwordLastUpdated": updatedAt,
 	})
@@ -176,9 +250,25 @@ func (a *AdminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // handleChangePassword 处理密码修改请求。
 // 安全流程：IP 白名单 → 速率限制 → 请求体大小限制 → JSON 解析 → 旧密码验证 → 新密码更新。
+// 白名单与速率限制先于任何响应（包括 OPTIONS 预检）。
 // 密码修改成功后，会踢出所有已认证的 WebSocket 客户端并断开它们的连接。
 func (a *AdminServer) handleChangePassword(w http.ResponseWriter, r *http.Request) {
-	setCORS(w)
+	setJSONContentType(w)
+
+	ip := clientIP(r)
+
+	// 1. IP 白名单（先于任何响应，包括 OPTIONS 预检）
+	if !isAllowed(ip, a.cfg.Admin.AllowedIPs) {
+		writeJSON(w, 403, map[string]string{"error": "Forbidden"})
+		return
+	}
+
+	// 2. 速率限制（先于任何响应，包括 OPTIONS 预检）
+	if a.limiter.isLimited(ip, a.cfg.Admin.RateLimitWindowMs, a.cfg.Admin.RateLimitMaxReqs) {
+		writeJSON(w, 429, map[string]string{"error": "Too many requests. Try again later."})
+		return
+	}
+
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(204)
 		return
@@ -186,20 +276,6 @@ func (a *AdminServer) handleChangePassword(w http.ResponseWriter, r *http.Reques
 
 	if r.Method != "POST" {
 		writeJSON(w, 405, map[string]string{"error": "Method not allowed"})
-		return
-	}
-
-	ip := clientIP(r)
-
-	// 1. IP 白名单
-	if !isAllowed(ip, a.cfg.Admin.AllowedIPs) {
-		writeJSON(w, 403, map[string]string{"error": "Forbidden"})
-		return
-	}
-
-	// 2. 速率限制
-	if a.limiter.isLimited(ip, a.cfg.Admin.RateLimitWindowMs, a.cfg.Admin.RateLimitMaxReqs) {
-		writeJSON(w, 429, map[string]string{"error": "Too many requests. Try again later."})
 		return
 	}
 
@@ -236,16 +312,15 @@ func (a *AdminServer) handleChangePassword(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// 6. 执行密码修改
+	// 6. 执行密码修改。任何失败一律返回同一状态码与同一文案，
+	// 细节只写服务端日志——既避免内部错误（如 bcrypt 细节、磁盘错误）
+	// 泄露给客户端，也消除 403/400 状态码差异构成的旧密码探测预言机。
 	err = changePassword(a.cfg, req.OldPassword, req.NewPassword)
 	if err != nil {
-		status := 400
-		if err == errOldPasswordIncorrect {
-			status = 403 // 旧密码错误返回 403
-		}
-		writeJSON(w, status, map[string]interface{}{
+		golog.Warn("Change password failed: " + err.Error() + " ip=" + ip)
+		writeJSON(w, 403, map[string]interface{}{
 			"success": false,
-			"error":   err.Error(),
+			"error":   "Invalid old or new password",
 		})
 		return
 	}
@@ -259,12 +334,11 @@ func (a *AdminServer) handleChangePassword(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// setCORS 设置跨域响应头和 Content-Type，使管理 API 可以从浏览器访问。
-func setCORS(w http.ResponseWriter) {
+// setJSONContentType 设置 JSON 响应的 Content-Type。
+// 不发送任何 CORS 头：管理 API 面向服务端工具调用，
+// 浏览器跨域请求将因预检失败被阻断（消除 ACAO:* 带来的跨域改密风险）。
+func setJSONContentType(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 }
 
 // writeJSON 以指定 HTTP 状态码返回 JSON 响应。

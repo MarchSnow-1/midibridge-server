@@ -1,7 +1,7 @@
 package main
 
 import (
-golog "github.com/donnie4w/go-logger/logger"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,11 +9,27 @@ golog "github.com/donnie4w/go-logger/logger"
 	"sync"
 	"time"
 
+	golog "github.com/donnie4w/go-logger/logger"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// defaultPassword 是首次运行时自动生成的初始密码，管理员应尽快修改。
-const defaultPassword = "midiBridge123"
+// initialPasswordLength 首次运行时生成的随机初始密码长度。
+const initialPasswordLength = 16
+
+// generateInitialPassword 使用加密安全随机数（crypto/rand）生成初始密码。
+// 字符集排除了易混淆字符（0/O、1/l/I）。生成的密码仅在首次启动时打印一次到控制台，
+// 不落日志文件、配置文件中只保存其 bcrypt 哈希。
+func generateInitialPassword() (string, error) {
+	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+	buf := make([]byte, initialPasswordLength)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("failed to generate random password: %w", err)
+	}
+	for i := range buf {
+		buf[i] = alphabet[int(buf[i])%len(alphabet)]
+	}
+	return string(buf), nil
+}
 
 // Config 是服务端全部配置的顶层结构，所有子配置直接嵌入 JSON 的顶层字段。
 // 内部包含一个读写锁和文件路径，用于线程安全的持久化操作。
@@ -23,6 +39,8 @@ type Config struct {
 	Auth    AuthConfig    `json:"auth"`
 	MIDI    MIDIConfig    `json:"midi"`
 	Logging LoggingConfig `json:"logging"`
+	Network NetworkConfig `json:"network"`
+	TLS     TLSConfig     `json:"tls"`
 
 	mu   sync.RWMutex // 保护配置字段的并发读写
 	path string       // config.json 的绝对路径
@@ -61,6 +79,23 @@ type LoggingConfig struct {
 	MidiVerbose bool `json:"midiVerbose"` // 是否记录每条 MIDI 按键/控制事件，默认 false
 }
 
+// NetworkConfig 网络监听配置
+type NetworkConfig struct {
+	Bind string `json:"bind"` // 监听地址。为空表示监听所有网络接口
+}
+
+// TLSConfig TLS 证书配置。两个路径同时配置时启用 TLS
+// （WebSocket 端口升级为 wss、管理端口升级为 https），任一为空则保持明文。
+type TLSConfig struct {
+	Cert string `json:"cert"` // 证书文件路径（PEM）
+	Key  string `json:"key"`  // 私钥文件路径（PEM）
+}
+
+// TLSEnabled 返回是否同时配置了证书与私钥（即是否启用 TLS）。
+func (c *Config) TLSEnabled() bool {
+	return c.TLS.Cert != "" && c.TLS.Key != ""
+}
+
 // defaultConfig 返回一份带有合理默认值的全新 Config 实例。
 // 该函数不涉及任何 I/O 操作，仅构造数据结构。
 func defaultConfig() Config {
@@ -88,6 +123,13 @@ func defaultConfig() Config {
 			File:        false,
 			MidiVerbose: false,
 		},
+		Network: NetworkConfig{
+			Bind: "",
+		},
+		TLS: TLSConfig{
+			Cert: "",
+			Key:  "",
+		},
 	}
 }
 
@@ -99,18 +141,28 @@ func loadConfig(configPath string) (*Config, error) {
 	cfg.path = configPath
 
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		// 首次运行，生成默认配置
-		golog.Info("First run, generating default config...")
-		hash, err := bcrypt.GenerateFromPassword([]byte(defaultPassword), 10)
+		// 首次运行：生成随机初始密码并保存其哈希
+		golog.Info("First run, generating default config with a random initial password...")
+		initialPassword, err := generateInitialPassword()
 		if err != nil {
-			return nil, fmt.Errorf("failed to hash default password: %w", err)
+			return nil, err
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte(initialPassword), 10)
+		if err != nil {
+			return nil, fmt.Errorf("failed to hash initial password: %w", err)
 		}
 		cfg.Auth.PasswordHash = string(hash)
 		cfg.Auth.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 		if err := cfg.save(); err != nil {
 			return nil, err
 		}
-		golog.Warn("pls change default password: " + defaultPassword)
+		// 初始密码只打印到控制台一次（不走日志系统，避免落入日志文件）。
+		fmt.Println("==============================================================")
+		fmt.Println("  INITIAL ADMIN PASSWORD (printed only once):")
+		fmt.Println("  " + initialPassword)
+		fmt.Println("  Change it immediately via /admin/change-password")
+		fmt.Println("==============================================================")
+		golog.Warn("A random initial password was generated and printed to the console. Change it immediately.")
 		return &cfg, nil
 	}
 
@@ -123,14 +175,60 @@ func loadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("corrupted config file, delete it and restart: %w", err)
 	}
 
+	// 检测未知键（顶层+嵌套，如拼错的 allowedIps），仅告警不拒绝加载——
+	// 避免安全关键配置因拼写错误而静默失效
+	var rawKeys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawKeys); err == nil {
+		warnUnknownKeys("", rawKeys)
+	}
+
+	// 校验并纠正非法配置值
+	cfg.validate()
+
 	golog.Info("Config loaded")
 	return &cfg, nil
 }
 
+// validate 校验加载后的配置值。非法值回退为默认值并记录告警，
+// 防止畸形配置（如 rateLimitWindowMs<=0）静默禁用速率限制等安全机制。
+func (c *Config) validate() {
+	if c.WS.Port < 1 || c.WS.Port > 65535 {
+		golog.Warn(fmt.Sprintf("Invalid ws.port %d, falling back to 9001", c.WS.Port))
+		c.WS.Port = 9001
+	}
+	if c.Admin.Port < 1 || c.Admin.Port > 65535 {
+		golog.Warn(fmt.Sprintf("Invalid admin.port %d, falling back to 9002", c.Admin.Port))
+		c.Admin.Port = 9002
+	}
+	if c.Admin.RateLimitWindowMs <= 0 {
+		golog.Warn(fmt.Sprintf("Invalid admin.rateLimitWindowMs %d, falling back to 60000", c.Admin.RateLimitWindowMs))
+		c.Admin.RateLimitWindowMs = 60000
+	}
+	if c.Admin.RateLimitMaxReqs <= 0 {
+		golog.Warn(fmt.Sprintf("Invalid admin.rateLimitMaxRequests %d, falling back to 5", c.Admin.RateLimitMaxReqs))
+		c.Admin.RateLimitMaxReqs = 5
+	}
+	if c.MIDI.ReconnectIntervalMs <= 0 {
+		golog.Warn(fmt.Sprintf("Invalid midi.reconnectIntervalMs %d, falling back to 3000", c.MIDI.ReconnectIntervalMs))
+		c.MIDI.ReconnectIntervalMs = 3000
+	}
+	// TLS 证书与私钥必须成对配置，只配其一视为无效并告警
+	if (c.TLS.Cert == "") != (c.TLS.Key == "") {
+		golog.Warn("tls.cert and tls.key must be configured together — TLS disabled")
+		c.TLS.Cert = ""
+		c.TLS.Key = ""
+	}
+}
+
 // save 将当前配置以缩进格式写回磁盘。首次保存时自动创建 data 目录。
+// 安全性与健壮性：
+//   - 目录权限 0700、文件权限 0600（内含密码的 bcrypt 哈希，
+//     防止同机其他用户读取后离线爆破）
+//   - 先写临时文件再 rename 的原子替换：崩溃/断电不会留下半截 JSON
+//     导致下次启动无法加载配置
 func (c *Config) save() error {
 	dir := filepath.Dir(c.path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
 
@@ -139,7 +237,14 @@ func (c *Config) save() error {
 		return err
 	}
 
-	return os.WriteFile(c.path, data, 0644)
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	// Go 的 os.Rename 在 Windows 上使用 MoveFileEx(REPLACE_EXISTING)，
+	// 可覆盖已存在文件；在 Unix 上等价于 rename(2)，同样原子替换。
+	// 旧文件在 rename 成功前始终存在——不存在"删了旧文件、新文件还没就位"的窗口。
+	return os.Rename(tmp, c.path)
 }
 
 // SetPasswordHash 更新密码哈希并立即持久化到磁盘。
@@ -150,4 +255,77 @@ func (c *Config) SetPasswordHash(hash string) error {
 	c.Auth.PasswordHash = hash
 	c.Auth.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	return c.save()
+}
+
+// GetAuthSnapshot 在读锁下返回密码哈希与更新时间的快照。
+// 所有读取方必须经由本接口，不得直接访问 Auth 字段，
+// 否则与写锁路径构成数据竞争。
+func (c *Config) GetAuthSnapshot() (hash, updatedAt string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Auth.PasswordHash, c.Auth.UpdatedAt
+}
+
+// setPasswordHashLocked 在调用方已持有写锁时更新哈希并落盘。
+// 供 changePassword 在"验证旧密码→写入新哈希"的原子区间内使用，
+// 避免嵌套调用 SetPasswordHash 造成死锁。
+// 先序列化验证，落盘成功后才更新内存——避免落盘失败时
+// 内存与磁盘不一致（运行时用新密码、重启后回退旧密码）。
+func (c *Config) setPasswordHashLocked(hash string) error {
+	oldHash := c.Auth.PasswordHash
+	oldUpdatedAt := c.Auth.UpdatedAt
+
+	c.Auth.PasswordHash = hash
+	c.Auth.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+
+	if err := c.save(); err != nil {
+		// 落盘失败：回滚内存状态，保持与磁盘一致
+		c.Auth.PasswordHash = oldHash
+		c.Auth.UpdatedAt = oldUpdatedAt
+		return err
+	}
+	return nil
+}
+
+// configKnownKeys 描述每个配置节支持的合法子键。
+// 用于递归检测未知键（含嵌套对象内部的拼写错误）。
+var configKnownKeys = map[string]map[string]bool{
+	"ws":      {"port": true, "allowedIPs": true},
+	"admin":   {"port": true, "allowedIPs": true, "rateLimitWindowMs": true, "rateLimitMaxRequests": true},
+	"auth":    {"passwordHash": true, "updatedAt": true},
+	"midi":    {"deviceName": true, "autoReconnect": true, "reconnectIntervalMs": true},
+	"logging": {"file": true, "midiVerbose": true},
+	"network": {"bind": true},
+	"tls":     {"cert": true, "key": true},
+}
+
+// warnUnknownKeys 递归检测配置 JSON 中的未知键。
+// prefix 为空表示顶层；嵌套对象的键以 "ws.port" 形式报告。
+func warnUnknownKeys(prefix string, raw map[string]json.RawMessage) {
+	for k, v := range raw {
+		full := k
+		if prefix != "" {
+			full = prefix + "." + k
+		}
+
+		// 查找已知键集合
+		knownSet, isSection := configKnownKeys[prefix]
+		if prefix == "" {
+			// 顶层：合法键 = 七个节名
+			if _, ok := configKnownKeys[k]; !ok {
+				golog.Warn("Unknown config key \"" + full + "\" ignored — check for typos")
+			} else {
+				// 是已知节，递归检查其子键
+				var sub map[string]json.RawMessage
+				if json.Unmarshal(v, &sub) == nil && sub != nil {
+					warnUnknownKeys(k, sub)
+				}
+			}
+		} else {
+			// 嵌套层：检查是否为该节的已知子键
+			if isSection && !knownSet[k] {
+				golog.Warn("Unknown config key \"" + full + "\" ignored — check for typos")
+			}
+		}
+	}
 }
