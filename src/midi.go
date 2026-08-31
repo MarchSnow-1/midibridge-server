@@ -148,17 +148,19 @@ func (m *MidiReader) Stop() {
 	m.mu.Unlock()
 
 	// 等待主循环（含 readLoop）完全退出，之后再关闭对外 channel，
-	// 杜绝向已关闭 channel 发送的窗口
+	// 杜绝向已关闭 channel 发送的窗口。
+	// 超时后不关闭 channel——驱动回调可能仍在运行，
+	// 向已关闭 channel 发送会 panic。进程即将退出，泄漏可接受。
 	if loopDone != nil {
 		select {
 		case <-loopDone:
+			close(m.Msgs)
+			close(m.Connects)
+			close(m.Disconnects)
 		case <-time.After(5 * time.Second):
-			golog.Warn("Timed out waiting for MIDI loop to exit — closing channels anyway")
+			golog.Warn("Timed out waiting for MIDI loop to exit — channels left open (process exiting)")
 		}
 	}
-	close(m.Msgs)
-	close(m.Connects)
-	close(m.Disconnects)
 	golog.Info("MIDI reader stopped")
 }
 
