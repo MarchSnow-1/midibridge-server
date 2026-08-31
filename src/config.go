@@ -175,16 +175,11 @@ func loadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("corrupted config file, delete it and restart: %w", err)
 	}
 
-	// 检测未知顶层键（如拼错的 allowedIps），仅告警不拒绝加载——
+	// 检测未知键（顶层+嵌套，如拼错的 allowedIps），仅告警不拒绝加载——
 	// 避免安全关键配置因拼写错误而静默失效
 	var rawKeys map[string]json.RawMessage
 	if err := json.Unmarshal(data, &rawKeys); err == nil {
-		known := map[string]bool{"ws": true, "admin": true, "auth": true, "midi": true, "logging": true, "network": true, "tls": true}
-		for k := range rawKeys {
-			if !known[k] {
-				golog.Warn("Unknown config key \"" + k + "\" ignored — check for typos")
-			}
-		}
+		warnUnknownKeys("", rawKeys)
 	}
 
 	// 校验并纠正非法配置值
@@ -246,6 +241,9 @@ func (c *Config) save() error {
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
 	}
+	// Windows 上 os.Rename 到已存在的文件会失败；
+	// 先删除旧文件再 rename（两者之间崩溃的概率远低于写一半的概率）
+	os.Remove(c.path)
 	return os.Rename(tmp, c.path)
 }
 
@@ -271,8 +269,63 @@ func (c *Config) GetAuthSnapshot() (hash, updatedAt string) {
 // setPasswordHashLocked 在调用方已持有写锁时更新哈希并落盘。
 // 供 changePassword 在"验证旧密码→写入新哈希"的原子区间内使用，
 // 避免嵌套调用 SetPasswordHash 造成死锁。
+// 先序列化验证，落盘成功后才更新内存——避免落盘失败时
+// 内存与磁盘不一致（运行时用新密码、重启后回退旧密码）。
 func (c *Config) setPasswordHashLocked(hash string) error {
+	oldHash := c.Auth.PasswordHash
+	oldUpdatedAt := c.Auth.UpdatedAt
+
 	c.Auth.PasswordHash = hash
 	c.Auth.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-	return c.save()
+
+	if err := c.save(); err != nil {
+		// 落盘失败：回滚内存状态，保持与磁盘一致
+		c.Auth.PasswordHash = oldHash
+		c.Auth.UpdatedAt = oldUpdatedAt
+		return err
+	}
+	return nil
+}
+
+// configKnownKeys 描述每个配置节支持的合法子键。
+// 用于递归检测未知键（含嵌套对象内部的拼写错误）。
+var configKnownKeys = map[string]map[string]bool{
+	"ws":      {"port": true, "allowedIPs": true},
+	"admin":   {"port": true, "allowedIPs": true, "rateLimitWindowMs": true, "rateLimitMaxRequests": true},
+	"auth":    {"passwordHash": true, "updatedAt": true},
+	"midi":    {"deviceName": true, "autoReconnect": true, "reconnectIntervalMs": true},
+	"logging": {"file": true, "midiVerbose": true},
+	"network": {"bind": true},
+	"tls":     {"cert": true, "key": true},
+}
+
+// warnUnknownKeys 递归检测配置 JSON 中的未知键。
+// prefix 为空表示顶层；嵌套对象的键以 "ws.port" 形式报告。
+func warnUnknownKeys(prefix string, raw map[string]json.RawMessage) {
+	for k, v := range raw {
+		full := k
+		if prefix != "" {
+			full = prefix + "." + k
+		}
+
+		// 查找已知键集合
+		knownSet, isSection := configKnownKeys[prefix]
+		if prefix == "" {
+			// 顶层：合法键 = 七个节名
+			if _, ok := configKnownKeys[k]; !ok {
+				golog.Warn("Unknown config key \"" + full + "\" ignored — check for typos")
+			} else {
+				// 是已知节，递归检查其子键
+				var sub map[string]json.RawMessage
+				if json.Unmarshal(v, &sub) == nil && sub != nil {
+					warnUnknownKeys(k, sub)
+				}
+			}
+		} else {
+			// 嵌套层：检查是否为该节的已知子键
+			if isSection && !knownSet[k] {
+				golog.Warn("Unknown config key \"" + full + "\" ignored — check for typos")
+			}
+		}
+	}
 }

@@ -101,6 +101,7 @@ const (
 type authGuard struct {
 	mu    sync.Mutex
 	fails map[string]*authFailEntry
+	stop  chan struct{} // 停止清理协程的信号
 }
 
 // authFailEntry 记录单个 IP 的认证失败统计与封禁状态。
@@ -112,23 +113,42 @@ type authFailEntry struct {
 
 // newAuthGuard 创建守卫并启动过期条目清理协程（防止 fails 表无限增长）。
 func newAuthGuard() *authGuard {
-	g := &authGuard{fails: make(map[string]*authFailEntry)}
+	g := &authGuard{
+		fails: make(map[string]*authFailEntry),
+		stop:  make(chan struct{}),
+	}
 	go g.cleanupLoop()
 	return g
 }
 
+// shutdown 停止清理协程。
+func (g *authGuard) shutdown() {
+	select {
+	case <-g.stop:
+	default:
+		close(g.stop)
+	}
+}
+
 // cleanupLoop 定期删除窗口过期且封禁到期的条目。
+// 监听 stop 信号使协程在服务器关闭时退出，不泄漏。
 func (g *authGuard) cleanupLoop() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
 	for {
-		time.Sleep(60 * time.Second)
-		now := time.Now()
-		g.mu.Lock()
-		for ip, e := range g.fails {
-			if e.blockedUntil.Before(now) && now.Sub(e.windowStart) > wsAuthFailWindow {
-				delete(g.fails, ip)
+		select {
+		case <-g.stop:
+			return
+		case <-ticker.C:
+			now := time.Now()
+			g.mu.Lock()
+			for ip, e := range g.fails {
+				if e.blockedUntil.Before(now) && now.Sub(e.windowStart) > wsAuthFailWindow {
+					delete(g.fails, ip)
+				}
 			}
+			g.mu.Unlock()
 		}
-		g.mu.Unlock()
 	}
 }
 
@@ -199,7 +219,7 @@ func (s *WSServer) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleConnection)
 
-	addr := s.cfg.Network.Bind + ":" + strconv.Itoa(s.cfg.WS.Port)
+	addr := net.JoinHostPort(s.cfg.Network.Bind, strconv.Itoa(s.cfg.WS.Port))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen WebSocket on %s: %w", addr, err)
@@ -572,6 +592,7 @@ func (s *WSServer) Stop() {
 		s.httpServer.Close()
 	}
 	close(s.done)
+	s.authGuard.shutdown() // 停止认证守卫的清理协程
 	golog.Info("WebSocket server stopped")
 }
 
