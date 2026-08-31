@@ -241,9 +241,9 @@ func (c *Config) save() error {
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
 	}
-	// Windows 上 os.Rename 到已存在的文件会失败；
-	// 先删除旧文件再 rename（两者之间崩溃的概率远低于写一半的概率）
-	os.Remove(c.path)
+	// Go 的 os.Rename 在 Windows 上使用 MoveFileEx(REPLACE_EXISTING)，
+	// 可覆盖已存在文件；在 Unix 上等价于 rename(2)，同样原子替换。
+	// 旧文件在 rename 成功前始终存在——不存在"删了旧文件、新文件还没就位"的窗口。
 	return os.Rename(tmp, c.path)
 }
 
