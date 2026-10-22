@@ -1,12 +1,12 @@
 module github.com/MarchSnow-1/midibridge-server
 
-go 1.26.3
+go 1.27.3
 
 require (
 	github.com/gorilla/websocket v1.5.3
 	gitlab.com/gomidi/midi v1.23.7
 	gitlab.com/gomidi/rtmididrv v0.15.0
-	golang.org/x/crypto v0.51.0
+	golang.org/x/crypto v0.58.0
 )
 
 require (

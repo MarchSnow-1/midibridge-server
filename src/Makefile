@@ -1,6 +1,6 @@
 # MIDI Bridge Server — Makefile
-#   用法:
-#     make build       默认构建 (输出到 dist/)
+#   用法（在 src/ 目录下运行）:
+#     make build       默认构建 (输出到仓库根 dist/)
 #     make version     打印当前版本号
 #     make clean       清理构建产物
 
@@ -13,13 +13,13 @@ LDFLAGS := -X main.version=$(VERSION)
 
 build:
 	@echo [build] version: $(VERSION)
-	@mkdir -p dist
-	CGO_ENABLED=1 go build -ldflags "$(LDFLAGS)" -o dist/midibridge-server.exe ./src/
-	@echo [done] dist/midibridge-server.exe
+	@mkdir -p ../dist
+	CGO_ENABLED=1 go build -ldflags "$(LDFLAGS)" -o ../dist/midibridge-server.exe .
+	@echo [done] ../dist/midibridge-server.exe
 
 version:
 	@echo $(VERSION)
 
 clean:
-	@rm -rf dist/
-	@echo [clean] dist/ removed
+	@rm -rf ../dist/
+	@echo [clean] ../dist/ removed

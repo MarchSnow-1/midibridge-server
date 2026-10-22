@@ -72,16 +72,16 @@ Windows
 ```bash
 # Clone the repo
 git clone https://github.com/MarchSnow-1/midibridge-server.git
-cd midibridge-server
+cd midibridge-server/src
 
 # Fetch dependencies
 go mod tidy
 
 # Build
-go build -o dist/midibridge-server.exe ./src/
+go build -o ../dist/midibridge-server.exe .
 
 # Run
-./dist/midibridge-server.exe
+../dist/midibridge-server.exe
 ```
 
 Linux / macOS
@@ -89,21 +89,21 @@ Linux / macOS
 ```bash
 # Clone the repo
 git clone https://github.com/MarchSnow-1/midibridge-server.git
-cd midibridge-server
+cd midibridge-server/src
 
 # Fetch dependencies
 go mod tidy
 
 # Build
-go build -o dist/midibridge-server ./src/
+go build -o ../dist/midibridge-server .
 
 # Run
-./dist/midibridge-server
+../dist/midibridge-server
 ```
 
 ### Makefile
 
-A Makefile is provided (`make build`, `make version`, `make clean`). Note: it produces a Windows-style `.exe` name on all platforms and uses POSIX commands — on Windows, run it from Git Bash / MSYS2. Manual `go build` (above) works everywhere.
+A Makefile is provided in `src/` (`make build`, `make version`, `make clean`). It must be run from `src/`. Note: it produces a Windows-style `.exe` name on all platforms and uses POSIX commands — on Windows, run it from Git Bash / MSYS2. Manual `go build` (above) works everywhere.
 
 ## Change Password
 

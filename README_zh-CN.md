@@ -72,16 +72,16 @@ Windows
 ```bash
 # 获取源代码
 git clone https://github.com/MarchSnow-1/midibridge-server.git
-cd midibridge-server
+cd midibridge-server/src
 
 # 拉取依赖
 go mod tidy
 
 # 编译
-go build -o dist/midibridge-server.exe ./src/
+go build -o ../dist/midibridge-server.exe .
 
 # 运行
-./dist/midibridge-server.exe
+../dist/midibridge-server.exe
 ```
 
 Linux / macOS
@@ -89,21 +89,21 @@ Linux / macOS
 ```bash
 # 获取源代码
 git clone https://github.com/MarchSnow-1/midibridge-server.git
-cd midibridge-server
+cd midibridge-server/src
 
 # 拉取依赖
 go mod tidy
 
 # 编译
-go build -o dist/midibridge-server ./src/
+go build -o ../dist/midibridge-server .
 
 # 运行
-./dist/midibridge-server
+../dist/midibridge-server
 ```
 
 ### Makefile
 
-仓库提供 Makefile（`make build`、`make version`、`make clean`）。注意：产物名硬编码为 `.exe` 且使用 POSIX 命令——Windows 上请在 Git Bash / MSYS2 中运行。手动 `go build`（上方）在所有平台可用。
+`src/` 目录提供 Makefile（`make build`、`make version`、`make clean`），需在 `src/` 下运行。注意：产物名硬编码为 `.exe` 且使用 POSIX 命令——Windows 上请在 Git Bash / MSYS2 中运行。手动 `go build`（上方）在所有平台可用。
 
 ## 修改密码
 
