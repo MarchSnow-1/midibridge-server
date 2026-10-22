@@ -66,7 +66,8 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          # go.mod is the single source of truth for the toolchain version.
+          go-version-file: src/go.mod
 
       - name: Install deps (Linux)
         if: runner.os == 'Linux'
@@ -120,7 +121,16 @@ jobs:
           echo "VERSION=${VER}" >> "$GITHUB_OUTPUT"
           echo "Computed version: ${VER}"
 
+      - name: Vulnerability scan
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
       - name: Build
+        working-directory: src
         shell: bash
         run: |
           export CGO_ENABLED=1
@@ -133,8 +143,8 @@ jobs:
 
           go build \
             -ldflags "-X main.version=${{ steps.version.outputs.VERSION }}" \
-            -o dist/midibridge-server${{ matrix.ext }} \
-            ./src/
+            -o ../dist/midibridge-server${{ matrix.ext }} \
+            .
 
       - name: Rename binary
         shell: bash
