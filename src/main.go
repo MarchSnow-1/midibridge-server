@@ -13,7 +13,7 @@ import (
 )
 
 // version 在编译时通过 ldflags 注入，默认 "dev" 表示开发构建。
-// 构建命令: go build -ldflags "-X main.version=v1.2.3" ./src/
+// 构建命令（在本目录执行）: go build -ldflags "-X main.version=v1.2.3" -o ../dist/midibridge-server .
 var version = "dev"
 
 // main 是 MIDI Bridge Server 的入口函数。启动流程：
