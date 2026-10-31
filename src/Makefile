@@ -17,8 +17,12 @@ VERSION ?= $(shell git describe --tags --always --long --dirty 2>/dev/null || ec
 # Linux links only libgcc and libstdc++ statically and keeps libc and libasound dynamic, which is what linking against the system audio stack requires
 # macOS ships libc++ and the frameworks with the OS, so it needs no extra flag
 ifeq ($(OS),Windows_NT)
+# 产物名只在 Windows 上带 .exe，与 CI 的裸产物命名一致
+# The output name carries .exe only on Windows, matching the bare artifact naming used by CI
+	BIN := ../dist/midibridge-server.exe
 	EXTLDFLAGS := -extldflags '-static'
 else
+	BIN := ../dist/midibridge-server
 	UNAME_S := $(shell uname -s 2>/dev/null)
 ifneq ($(UNAME_S),Darwin)
 	EXTLDFLAGS := -extldflags '-static-libgcc -static-libstdc++'
@@ -32,8 +36,8 @@ LDFLAGS := $(strip -X main.version=$(VERSION) $(EXTLDFLAGS))
 build:
 	@echo [build] version: $(VERSION)
 	@mkdir -p ../dist
-	CGO_ENABLED=1 go build -ldflags "$(LDFLAGS)" -o ../dist/midibridge-server.exe .
-	@echo [done] ../dist/midibridge-server.exe
+	CGO_ENABLED=1 go build -ldflags "$(LDFLAGS)" -o $(BIN) .
+	@echo [done] $(BIN)
 
 version:
 	@echo $(VERSION)
