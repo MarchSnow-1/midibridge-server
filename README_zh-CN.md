@@ -21,7 +21,7 @@
 
 ## 快速开始（使用 Release 二进制）
 
-从 [Releases](https://github.com/MarchSnow-1/midibridge-server/releases) 下载对应平台的二进制，解压后直接运行：
+从 [Releases](https://github.com/MarchSnow-1/midibridge-server/releases) 下载对应平台的二进制，直接运行：
 
 ```bash
 ./midibridge-server

@@ -21,7 +21,7 @@ Stream USB MIDI signals from keyboards and synthesizers to other computers over 
 
 ## Quick Start (Release Binary)
 
-Download the binary for your platform from [Releases](https://github.com/MarchSnow-1/midibridge-server/releases), extract and run:
+Download the binary for your platform from [Releases](https://github.com/MarchSnow-1/midibridge-server/releases) and run it:
 
 ```bash
 ./midibridge-server
