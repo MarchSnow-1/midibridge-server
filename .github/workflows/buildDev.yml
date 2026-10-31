@@ -6,7 +6,45 @@ on:
       - main
 
 jobs:
+  check:
+    # 构建前的一次性检查，当前为漏洞扫描
+    # 扫描只依赖源码与依赖树，与目标平台无关，因此在这里跑一次而不是在矩阵里跑六次
+    # 失败会阻断 build，从而不会产出未扫描的产物
+    #
+    # The one-off checks before a build, currently the vulnerability scan
+    # The scan depends only on the source and the dependency tree, not on the target platform, so it runs once here instead of six times in the matrix
+    # A failure blocks build, so no artifact is produced without a passing scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          # 缓存键取 src/go.sum，否则 setup-go 在仓库根找不到依赖文件而跳过缓存
+          #
+          # The cache key reads src/go.sum, otherwise setup-go finds no dependency file at the repository root and skips the cache
+          cache-dependency-path: src/go.sum
+
+      - name: Install build dependencies
+        # 服务端因 rtmidi 需要 CGO，govulncheck ./... 要能编译整个模块，故装上 ALSA 与 C 编译器
+        #
+        # The server needs CGO because of rtmidi, so govulncheck ./... has to compile the whole module and requires ALSA and a C toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y libasound2-dev gcc g++
+
+      - name: Run govulncheck
+        working-directory: src
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
   build:
+    needs: check
+    if: always() && needs.check.result == 'success'
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -121,14 +159,6 @@ jobs:
           echo "VERSION=${VER}" >> "$GITHUB_OUTPUT"
           echo "Computed version: ${VER}"
 
-      - name: Vulnerability scan
-        working-directory: src
-        shell: bash
-        run: |
-          set -euo pipefail
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          "$(go env GOPATH)/bin/govulncheck" ./...
-
       - name: Build
         working-directory: src
         shell: bash
@@ -211,25 +241,14 @@ jobs:
             exit 1
           fi
 
-      - name: Package (Linux / macOS)
-        if: runner.os != 'Windows'
-        run: |
-          mkdir -p release/data
-          cp dist/MIDIBridge-Server-${{ steps.version.outputs.VERSION }}-${{ matrix.platform }}${{ matrix.ext }} release/
-          cd release && zip -r \
-            ../MIDIBridge-Server-${{ steps.version.outputs.VERSION }}-${{ matrix.platform }}.zip .
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path release\data | Out-Null
-          Copy-Item "dist\MIDIBridge-Server-${{ steps.version.outputs.VERSION }}-${{ matrix.platform }}${{ matrix.ext }}" release\
-          Compress-Archive -Path release\* `
-            -DestinationPath "MIDIBridge-Server-${{ steps.version.outputs.VERSION }}-${{ matrix.platform }}.zip"
-
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: MIDIBridge-Server-${{ steps.version.outputs.VERSION }}-${{ matrix.platform }}
-          path: MIDIBridge-Server-${{ steps.version.outputs.VERSION }}-${{ matrix.platform }}.zip
+          # 直传裸二进制，archive 为 false 时 artifact 名取自文件名，忽略 name
+          # 因此下游按 MIDIBridge-Server-<version>-<platform> 取到的就是可执行文件本身，没有额外的 zip 层
+          #
+          # Upload the bare binary directly, since archive false takes the artifact name from the filename and ignores name
+          # A downstream fetch of MIDIBridge-Server-<version>-<platform> therefore yields the executable itself without an extra zip layer
+          path: dist/MIDIBridge-Server-${{ steps.version.outputs.VERSION }}-${{ matrix.platform }}${{ matrix.ext }}
+          archive: false
+          if-no-files-found: error

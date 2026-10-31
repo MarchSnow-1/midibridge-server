@@ -6,7 +6,14 @@ on:
       - 'v*.*.*'
 
 jobs:
-  changelog:
+  check:
+    # 发布前的一次性检查，包含生成 changelog 与漏洞扫描
+    # 扫描只依赖源码与依赖树，与目标平台无关，因此在这里跑一次而不是在矩阵里跑六次
+    # 任一检查失败都会阻断 build，不产出未扫描的产物
+    #
+    # The one-off checks before a release, covering changelog generation and the vulnerability scan
+    # The scan depends only on the source and the dependency tree, not on the target platform, so it runs once here instead of six times in the matrix
+    # A failure in either check blocks build, so no artifact is produced without a passing scan
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -19,21 +26,50 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          # 缓存键取 src/go.sum，否则 setup-go 在仓库根找不到依赖文件而跳过缓存
+          #
+          # The cache key reads src/go.sum, otherwise setup-go finds no dependency file at the repository root and skips the cache
+          cache-dependency-path: src/go.sum
+
       - name: Generate release notes
         run: |
           npx auto-changelog-plus --starting-version ${{ github.ref_name }}
           sed -i '1,4d' CHANGELOG.md
 
+      - name: Install build dependencies
+        # 服务端因 rtmidi 需要 CGO，govulncheck ./... 要能编译整个模块，故装上 ALSA 与 C 编译器
+        #
+        # The server needs CGO because of rtmidi, so govulncheck ./... has to compile the whole module and requires ALSA and a C toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y libasound2-dev gcc g++
+
+      - name: Run govulncheck
+        working-directory: src
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
       - name: Upload changelog
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: changelog
+          # archive 为 false 时 artifact 名取自文件名，因此下游按 CHANGELOG.md 下载
+          # 文件缺失说明 changelog 生成失败，直接报错而不是让后续每个平台各自失败
+          #
+          # With archive false the artifact name comes from the filename, so downstream downloads it as CHANGELOG.md
+          # A missing file means changelog generation failed, so fail here instead of failing later in every platform job
           path: CHANGELOG.md
+          archive: false
+          if-no-files-found: error
 
   build:
     runs-on: ${{ matrix.os }}
-    needs: changelog
-    if: always() && (needs.changelog.result == 'success' || needs.changelog.result == 'skipped')
+    needs: check
+    if: always() && needs.check.result == 'success'
 
     strategy:
       fail-fast: false
@@ -132,14 +168,6 @@ jobs:
               ;;
           esac
 
-      - name: Vulnerability scan
-        working-directory: src
-        shell: bash
-        run: |
-          set -euo pipefail
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          "$(go env GOPATH)/bin/govulncheck" ./...
-
       - name: Build
         working-directory: src
         shell: bash
@@ -222,32 +250,20 @@ jobs:
             exit 1
           fi
 
-      - name: Package (Linux / macOS)
-        if: runner.os != 'Windows'
-        run: |
-          mkdir -p release/data
-          cp dist/MIDIBridge-Server-${{ github.ref_name }}-${{ matrix.platform }}${{ matrix.ext }} release/
-          cd release && zip -r \
-            ../MIDIBridge-Server-${{ github.ref_name }}-${{ matrix.platform }}.zip .
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path release\data | Out-Null
-          Copy-Item "dist\MIDIBridge-Server-${{ github.ref_name }}-${{ matrix.platform }}${{ matrix.ext }}" release\
-          Compress-Archive -Path release\* `
-            -DestinationPath "MIDIBridge-Server-${{ github.ref_name }}-${{ matrix.platform }}.zip"
-
       - name: Download changelog
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
-          name: changelog
+          name: CHANGELOG.md
 
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
+          # 产物是裸二进制，Windows 带 .exe 其他平台无后缀
+          # release 页面直接给出可执行文件本身，首次运行自动生成 data/config.json，因此不再附带 zip 与空目录
+          #
+          # Artifacts are bare binaries with .exe only on Windows
+          # The release page provides the executable itself, and data/config.json is generated on first run, so no zip or empty directory is shipped
           body_path: CHANGELOG.md
-          files: MIDIBridge-Server-${{ github.ref_name }}-${{ matrix.platform }}.zip
+          files: dist/MIDIBridge-Server-${{ github.ref_name }}-${{ matrix.platform }}${{ matrix.ext }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
